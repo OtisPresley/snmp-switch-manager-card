@@ -11,7 +11,7 @@ A lovelace card to be used with the SNMP Switch Manager integration for Home Ass
 
 ## Installation and Configuration
 
-1. Download the snmp-switch-manager-card.js file from the [SNMP Switch Manager Card](https://github.com/OtisPresley/snmp-switch-manager-card) repository and place it in `www/community/snmp-switch-manager-card/` in Home Assistant.
+1. Download the snmp-switch-manager-card.js file and place it in `www/community/snmp-switch-manager-card/` in Home Assistant.
 
 2. Add the card JavaScript as a resource under **Settings → Dashboards → Resources**:
 
