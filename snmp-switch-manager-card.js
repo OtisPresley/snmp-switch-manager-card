@@ -26,7 +26,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
       show_labels: config.show_labels !== false,
       label_size: Number.isFinite(config.label_size) ? Number(config.label_size) : 8,
 
-      // NEW: choose where Diagnostics/Virtual block appears
+      // choose where Diagnostics/Virtual block appears
       info_position: (config.info_position === "below") ? "below" : "above",
 
       // Scoping
@@ -172,11 +172,22 @@ class SnmpSwitchManagerCard extends HTMLElement {
     this._hass.callService("switch", on?"turn_off":"turn_on", { entity_id });
   }
 
+  // helper to call the set_port_description service
+  _updateAlias(entity_id, alias) {
+    if (!this._hass || !entity_id) return;
+    const description = (alias ?? "").trim();
+    this._hass.callService("snmp_switch_manager", "set_port_description", {
+      entity_id,
+      description,
+    });
+  }
+
   _openDialog(entity_id){
     const st=this._hass?.states?.[entity_id]; if(!st) return;
     const attrs=st.attributes||{};
     const name=attrs.Name || entity_id.split(".")[1];
     const ip=attrs.IP ? `<div><b>IP:</b> ${attrs.IP}</div>` : "";
+    const aliasValue = attrs.Alias ?? "";
 
     // remove any prior modal/style
     this._modalEl?.remove(); this._modalStyle?.remove();
@@ -192,7 +203,11 @@ class SnmpSwitchManagerCard extends HTMLElement {
           <div><b>Oper:</b> ${attrs.Oper ?? "-"}</div>
           ${ip}
           <div><b>Index:</b> ${attrs.Index ?? "-"}</div>
-          <div><b>Alias:</b> ${attrs.Alias ?? "-"}</div>
+          <div>
+            <b>Alias:</b>
+            <span class="alias-text">${aliasValue || "-"}</span>
+            <button class="btn small" data-alias-edit="${entity_id}">Edit</button>
+          </div>
         </div>
         <div class="ssm-modal-actions">
           <button class="btn wide" data-entity="${entity_id}">${this._buttonLabel(st)}</button>
@@ -215,6 +230,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
         background:var(--secondary-background-color);cursor:pointer}
       .btn.wide{flex:1;text-align:center}
       .btn.subtle{background:transparent}
+      .btn.small{padding:4px 8px;font-size:12px}
     `;
 
     const close = () => {
@@ -225,6 +241,20 @@ class SnmpSwitchManagerCard extends HTMLElement {
     this._modalEl.querySelector(".ssm-backdrop")?.addEventListener("click", close);
     this._modalEl.querySelector("[data-close]")?.addEventListener("click", close);
     this._modalEl.querySelector(".ssm-modal")?.addEventListener("click", (e)=>e.stopPropagation());
+
+    // Edit alias via prompt
+    const editBtn = this._modalEl.querySelector("[data-alias-edit]");
+    if (editBtn) {
+      editBtn.addEventListener("click", () => {
+        const current = attrs.Alias ?? "";
+        const next = window.prompt("Set port alias", current);
+        if (next === null) return; // cancelled
+        this._updateAlias(entity_id, next);
+        const span = this._modalEl?.querySelector(".alias-text");
+        if (span) span.textContent = next || "-";
+      });
+    }
+
     this._modalEl.querySelector(".btn.wide")?.addEventListener("click",(ev)=>{
       const id=ev.currentTarget.getAttribute("data-entity");
       this._toggle(id);
@@ -335,7 +365,9 @@ class SnmpSwitchManagerCard extends HTMLElement {
         const a=st.attributes||{};
         const name=a.Name || id.split(".")[1];
         const ip = a.IP ? ` • IP: ${a.IP}` : "";
-        return `<div class="port">
+        const aliasText = a.Alias ? `Alias: ${a.Alias}` : "";
+        const title = aliasText || name;
+        return `<div class="port" title="${title}">
           <div class="name">${name}</div>
           <div class="kv"><span class="dot" style="background:${this._colorFor(st)}"></span>
             Admin: ${a.Admin ?? "-"} • Oper: ${a.Oper ?? "-"}${ip}
