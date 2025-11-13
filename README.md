@@ -43,9 +43,9 @@ A lovelace card to be used with the [SNMP Switch Manager](https://github.com/Oti
    Clicking a port opens a dialog with quick actions to toggle the port or edit its description. There is also an alternative `list` view depicted in the      third image below.
 
     <p float="left">
-      <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot1.png" alt="Screenshot 1" width="270"/>
-      <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot2.png" alt="Screenshot 2" width="270"/>
-      <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot3.png" alt="Screenshot 3" width="270"/>
+      <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot1.png" alt="Screenshot 1" width="260"/>
+      <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot2.png" alt="Screenshot 2" width="260"/>
+      <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot3.png" alt="Screenshot 3" width="260"/>
     </p>
 
 ---
