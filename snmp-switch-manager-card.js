@@ -183,6 +183,15 @@ class SnmpSwitchManagerCard extends HTMLElement {
     this._hass.callService("switch", on ? "turn_off" : "turn_on", { entity_id });
   }
 
+  // HTML escape helper (used for SVG title text)
+  _htmlEscape(str) {
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
   // helper to call the set_port_description service
   _updateAlias(entity_id, alias) {
     if (!this._hass || !entity_id) return;
@@ -191,6 +200,17 @@ class SnmpSwitchManagerCard extends HTMLElement {
       entity_id,
       description,
     });
+  }
+
+  // shared prompt for alias editing
+  _promptAlias(entity_id, currentAlias) {
+    const st = this._hass?.states?.[entity_id];
+    const base = st?.attributes?.Alias ?? "";
+    const current = currentAlias != null ? currentAlias : base;
+    const next = window.prompt("Set port alias", current);
+    if (next === null) return null; // cancelled
+    this._updateAlias(entity_id, next);
+    return next;
   }
 
   _openDialog(entity_id) {
@@ -271,18 +291,16 @@ class SnmpSwitchManagerCard extends HTMLElement {
       e.stopPropagation();
     });
 
-    // Edit alias via prompt
+    // Edit alias via prompt (shared helper)
     const editBtn = this._modalEl.querySelector("[data-alias-edit]");
     if (editBtn) {
       editBtn.addEventListener("pointerdown", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        const current = attrs.Alias ?? "";
-        const next = window.prompt("Set port alias", current);
-        if (next === null) return; // cancelled
-        this._updateAlias(entity_id, next);
+        const updated = this._promptAlias(entity_id, aliasValue);
+        if (updated === null) return;
         const span = this._modalEl?.querySelector(".alias-text");
-        if (span) span.textContent = next || "-";
+        if (span) span.textContent = updated || "-";
       });
     }
 
@@ -315,7 +333,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
       .hint { opacity:.85; }
       .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(170px,1fr)); gap:10px; }
       .port { border:1px solid var(--divider-color); border-radius:12px; padding:10px; background:var(--card-background-color); }
-      .name { font-weight:700; margin-bottom:6px; }
+      .name { font-weight:700; margin-bottom:6px; cursor:pointer; }
       .kv { font-size:12px; color:var(--secondary-text-color); margin-bottom:10px; }
       .dot { width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:6px; }
       .btn { font:inherit; padding:10px 12px; border-radius:10px; border:1px solid var(--divider-color); background:var(--secondary-background-color); cursor:pointer; }
@@ -329,6 +347,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
       .virt-title { font-weight:700; margin-bottom:6px; }
       .virt-row { display:flex; align-items:center; gap:8px; padding:6px 0; font-size:14px; }
+      .virt-name { cursor:pointer; }
       .virt-row .btn { padding:6px 10px; font-size:12px; margin-left:auto; }
 
       .diag-title { font-weight:700; margin-bottom:6px; }
@@ -381,11 +400,17 @@ class SnmpSwitchManagerCard extends HTMLElement {
       const virtBox = (() => {
         if (!virt.length) return "";
         const rows = virt.map(([id, st]) => {
-          const n = st.attributes?.Name || id.split(".")[1] || id;
-          const ip = st.attributes?.IP ? ` — ${st.attributes.IP}` : "";
-          return `<div class="virt-row">
+          const a = st.attributes || {};
+          const n = a.Name || id.split(".")[1] || id;
+          const ip = a.IP ? ` — ${a.IP}` : "";
+          const alias = a.Alias;
+          const titleParts = [];
+          if (alias) titleParts.push(`Alias: ${alias}`);
+          titleParts.push(`${n}${ip}`);
+          const title = titleParts.join(" • ");
+          return `<div class="virt-row" title="${title}">
             <span class="dot" style="background:${this._colorFor(st)}"></span>
-            <span>${n}${ip}</span>
+            <span class="virt-name" data-alias-entity="${id}">${n}${ip}</span>
             <button class="btn" data-entity="${id}">${this._buttonLabel(st)}</button>
           </div>`;
         }).join("");
@@ -401,10 +426,13 @@ class SnmpSwitchManagerCard extends HTMLElement {
         const a = st.attributes || {};
         const name = a.Name || id.split(".")[1];
         const ip = a.IP ? ` • IP: ${a.IP}` : "";
-        const aliasText = a.Alias ? `Alias: ${a.Alias}` : "";
-        const title = aliasText || name;
+        const alias = a.Alias;
+        const titleParts = [];
+        if (alias) titleParts.push(`Alias: ${alias}`);
+        titleParts.push(`${name}${ip}`);
+        const title = titleParts.join(" • ");
         return `<div class="port" title="${title}">
-          <div class="name">${name}</div>
+          <div class="name" data-alias-entity="${id}">${name}</div>
           <div class="kv"><span class="dot" style="background:${this._colorFor(st)}"></span>
             Admin: ${a.Admin ?? "-"} • Oper: ${a.Oper ?? "-"}${ip}
           </div>
@@ -433,15 +461,22 @@ class SnmpSwitchManagerCard extends HTMLElement {
       const usableW = W - 2 * sidePad, slotW = usableW / perRow;
 
       const rects = phys.map(([id, st], i) => {
-        const name = String(st.attributes?.Name || id.split(".")[1] || "");
+        const a = st.attributes || {};
+        const name = String(a.Name || id.split(".")[1] || "");
+        const alias = a.Alias;
         const idx = i % perRow, row = Math.floor(i / perRow);
         const x = sidePad + idx * slotW + (slotW - P) / 2, y = topPad + row * (P + G) + 18;
         const fill = this._colorFor(st);
         const label = this._config.show_labels
           ? `<text class="label" x="${x + P / 2}" y="${y + P + this._config.label_size}" text-anchor="middle">${name}</text>`
           : "";
+        const titleParts = [];
+        if (alias) titleParts.push(`Alias: ${alias}`);
+        titleParts.push(name);
+        const title = this._htmlEscape(titleParts.join(" • "));
         return `
           <g class="port-svg" data-entity="${id}" tabindex="0" style="cursor:pointer">
+            <title>${title}</title>
             <rect x="${x}" y="${y}" width="${P}" height="${P}" rx="${Math.round(P * 0.2)}"
               fill="${fill}" stroke="rgba(0,0,0,.35)"/>
             ${label}
@@ -472,7 +507,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
       </ha-card>
     `;
 
-    // wire list buttons (virtual + physical) — still use click here
+    // wire list + virtual toggle buttons (keep click)
     this.shadowRoot.querySelectorAll(".btn[data-entity]").forEach(btn => {
       btn.addEventListener("click", (ev) => {
         ev.stopPropagation();
@@ -481,18 +516,41 @@ class SnmpSwitchManagerCard extends HTMLElement {
       });
     });
 
-    // wire panel ports -> modal (use pointerdown for reliability)
+    // alias editing from names (list + virtual) — use pointerdown for reliability
+    this.shadowRoot.querySelectorAll("[data-alias-entity]").forEach(el => {
+      el.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const id = el.getAttribute("data-alias-entity");
+        if (!id) return;
+        const st = this._hass?.states?.[id];
+        const currentAlias = st?.attributes?.Alias;
+        this._promptAlias(id, currentAlias);
+      });
+      el.addEventListener("keypress", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          const id = el.getAttribute("data-alias-entity");
+          if (!id) return;
+          const st = this._hass?.states?.[id];
+          const currentAlias = st?.attributes?.Alias;
+          this._promptAlias(id, currentAlias);
+        }
+      });
+    });
+
+    // wire panel ports -> modal (pointerdown for reliability)
     this.shadowRoot.querySelectorAll(".port-svg[data-entity]").forEach(g => {
       g.addEventListener("pointerdown", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        const id = ev.currentTarget.getAttribute("data-entity");
+        const id = g.getAttribute("data-entity");
         if (id) this._openDialog(id);
       });
       g.addEventListener("keypress", (ev) => {
         if (ev.key === "Enter" || ev.key === " ") {
           ev.preventDefault();
-          const id = ev.currentTarget.getAttribute("data-entity");
+          const id = g.getAttribute("data-entity");
           if (id) this._openDialog(id);
         }
       });
