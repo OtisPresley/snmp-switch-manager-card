@@ -59,10 +59,12 @@ class SnmpSwitchManagerCard extends HTMLElement {
       tasks.push(this._hass.callWS({ type: "config/device_registry/list" }).then(r => this._deviceReg = r));
     if (tasks.length) await Promise.all(tasks).catch(()=>{});
   }
+
   _deviceIdForEntity(entity_id) {
     const row = this._entityReg?.find(e => e.entity_id === entity_id);
     return row?.device_id ?? null;
   }
+
   async _resolveAnchorDeviceId() {
     if (!this._config.anchor_entity) return null;
     await this._ensureRegistries();
@@ -76,7 +78,11 @@ class SnmpSwitchManagerCard extends HTMLElement {
     if (!m) return null;
     return { kind: m[1], unit: +m[2], slot: +m[3], port: +m[4] };
   }
-  _kindPriority(k) { k = String(k||"").toUpperCase(); return k==="GI"?0 : k==="TE"?1 : k==="TW"?2 : 3; }
+
+  _kindPriority(k) {
+    k = String(k || "").toUpperCase();
+    return k === "GI" ? 0 : k === "TE" ? 1 : k === "TW" ? 2 : 3;
+  }
 
   _entityMatchesNameUnitSlot(id, st) {
     const attrs = st?.attributes || {};
@@ -86,10 +92,10 @@ class SnmpSwitchManagerCard extends HTMLElement {
       const fn = String(attrs.friendly_name || "").toLowerCase();
       if (!fn.includes(needle) && !id.toLowerCase().includes(needle)) return false;
     }
-    if (this._config.unit!=null || this._config.slot!=null) {
+    if (this._config.unit != null || this._config.slot != null) {
       const t = this._parseTriple(name); if (!t) return false;
-      if (this._config.unit!=null && t.unit!==this._config.unit) return false;
-      if (this._config.slot!=null && t.slot!==this._config.slot) return false;
+      if (this._config.unit != null && t.unit !== this._config.unit) return false;
+      if (this._config.slot != null && t.slot !== this._config.slot) return false;
     }
     return true;
   }
@@ -104,14 +110,14 @@ class SnmpSwitchManagerCard extends HTMLElement {
     }
 
     const entries = explicit
-      ? this._config.ports.map(id => [id, H[id]]).filter(([,st]) => !!st)
+      ? this._config.ports.map(id => [id, H[id]]).filter(([, st]) => !!st)
       : Object.entries(H).filter(([id, st]) => {
           if (!id.startsWith("switch.")) return false;
           if (!st?.attributes) return false;
 
           const attrs = st.attributes;
           const looksRight =
-            (attrs.Index!==undefined || attrs.Name) ||
+            (attrs.Index !== undefined || attrs.Name) ||
             /^switch\.(?:gi|te|tw)\d+_\d+_\d+$/i.test(id) ||
             /^switch\.(?:vl\d+|lo\d+|po\d+)$/i.test(id);
           if (!looksRight) return false;
@@ -126,50 +132,55 @@ class SnmpSwitchManagerCard extends HTMLElement {
         });
 
     if (!entries.length && !explicit) {
-      const candidates = Object.keys(H).filter(k => k.startsWith("switch.")).slice(0,20);
-      return { phys:[], virt:[], diag:candidates };
+      const candidates = Object.keys(H).filter(k => k.startsWith("switch.")).slice(0, 20);
+      return { phys: [], virt: [], diag: candidates };
     }
 
-    const phys=[], virt=[];
+    const phys = [], virt = [];
     for (const [id, st] of entries) {
       const n = String(st.attributes?.Name || id.split(".")[1] || "").toUpperCase();
-      if (/^(GI|TE|TW)/.test(n) || /^switch\.(gi|te|tw)\d+_\d+_\d+$/i.test(id)) phys.push([id,st]);
-      else virt.push([id,st]);
+      if (/^(GI|TE|TW)/.test(n) || /^switch\.(gi|te|tw)\d+_\d+_\d+$/i.test(id)) phys.push([id, st]);
+      else virt.push([id, st]);
     }
 
-    phys.sort((a,b)=>{
-      const na=a[1].attributes?.Name||a[0], nb=b[1].attributes?.Name||b[0];
-      const ta=this._parseTriple(na), tb=this._parseTriple(nb);
-      const ka=this._kindPriority(ta?.kind), kb=this._kindPriority(tb?.kind);
-      if (ka!==kb) return ka-kb;
-      if ((ta?.unit??1e9)!==(tb?.unit??1e9)) return (ta?.unit??1e9)-(tb?.unit??1e9);
-      if ((ta?.slot??1e9)!==(tb?.slot??1e9)) return (ta?.slot??1e9)-(tb?.slot??1e9);
-      if ((ta?.port??1e9)!==(tb?.port??1e9)) return (ta?.port??1e9)-(tb?.port??1e9);
-      return String(na).localeCompare(String(nb), undefined, {numeric:true,sensitivity:"base"});
+    phys.sort((a, b) => {
+      const na = a[1].attributes?.Name || a[0];
+      const nb = b[1].attributes?.Name || b[0];
+      const ta = this._parseTriple(na), tb = this._parseTriple(nb);
+      const ka = this._kindPriority(ta?.kind), kb = this._kindPriority(tb?.kind);
+      if (ka !== kb) return ka - kb;
+      if ((ta?.unit ?? 1e9) !== (tb?.unit ?? 1e9)) return (ta?.unit ?? 1e9) - (tb?.unit ?? 1e9);
+      if ((ta?.slot ?? 1e9) !== (tb?.slot ?? 1e9)) return (ta?.slot ?? 1e9) - (tb?.slot ?? 1e9);
+      if ((ta?.port ?? 1e9) !== (tb?.port ?? 1e9)) return (ta?.port ?? 1e9) - (tb?.port ?? 1e9);
+      return String(na).localeCompare(String(nb), undefined, { numeric: true, sensitivity: "base" });
     });
 
-    virt.sort((a,b)=>{
-      const na=String(a[1].attributes?.Name||a[0]);
-      const nb=String(b[1].attributes?.Name||b[0]);
-      return na.localeCompare(nb, undefined, {numeric:true,sensitivity:"base"});
+    virt.sort((a, b) => {
+      const na = String(a[1].attributes?.Name || a[0]);
+      const nb = String(b[1].attributes?.Name || b[0]);
+      return na.localeCompare(nb, undefined, { numeric: true, sensitivity: "base" });
     });
 
-    return { phys, virt, diag:null };
+    return { phys, virt, diag: null };
   }
 
   _colorFor(st) {
-    const a=String(st.attributes?.Admin||"").toLowerCase();
-    const o=String(st.attributes?.Oper||"").toLowerCase();
-    if (a==="down") return "#f59e0b";
-    if (a==="up" && o==="up") return "#22c55e";
-    if (a==="up" && o==="down") return "#ef4444";
+    const a = String(st.attributes?.Admin || "").toLowerCase();
+    const o = String(st.attributes?.Oper || "").toLowerCase();
+    if (a === "down") return "#f59e0b";
+    if (a === "up" && o === "up") return "#22c55e";
+    if (a === "up" && o === "down") return "#ef4444";
     return "#9ca3af";
   }
-  _buttonLabel(st){ return (st.state||"").toLowerCase()==="on" ? "Turn off" : "Turn on"; }
-  _toggle(entity_id){
-    const st=this._hass?.states?.[entity_id]; if(!st) return;
-    const on=(st.state||"").toLowerCase()==="on";
-    this._hass.callService("switch", on?"turn_off":"turn_on", { entity_id });
+
+  _buttonLabel(st) {
+    return (st.state || "").toLowerCase() === "on" ? "Turn off" : "Turn on";
+  }
+
+  _toggle(entity_id) {
+    const st = this._hass?.states?.[entity_id]; if (!st) return;
+    const on = (st.state || "").toLowerCase() === "on";
+    this._hass.callService("switch", on ? "turn_off" : "turn_on", { entity_id });
   }
 
   // helper to call the set_port_description service
@@ -182,11 +193,11 @@ class SnmpSwitchManagerCard extends HTMLElement {
     });
   }
 
-  _openDialog(entity_id){
-    const st=this._hass?.states?.[entity_id]; if(!st) return;
-    const attrs=st.attributes||{};
-    const name=attrs.Name || entity_id.split(".")[1];
-    const ip=attrs.IP ? `<div><b>IP:</b> ${attrs.IP}</div>` : "";
+  _openDialog(entity_id) {
+    const st = this._hass?.states?.[entity_id]; if (!st) return;
+    const attrs = st.attributes || {};
+    const name = attrs.Name || entity_id.split(".")[1];
+    const ip = attrs.IP ? `<div><b>IP:</b> ${attrs.IP}</div>` : "";
     const aliasValue = attrs.Alias ?? "";
 
     // remove any prior modal/style
@@ -238,14 +249,34 @@ class SnmpSwitchManagerCard extends HTMLElement {
       this._modalEl = null; this._modalStyle = null;
     };
 
-    this._modalEl.querySelector(".ssm-backdrop")?.addEventListener("click", close);
-    this._modalEl.querySelector("[data-close]")?.addEventListener("click", close);
-    this._modalEl.querySelector(".ssm-modal")?.addEventListener("click", (e)=>e.stopPropagation());
+    const backdrop = this._modalEl.querySelector(".ssm-backdrop");
+    if (backdrop) {
+      backdrop.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        close();
+      });
+    }
+
+    const closeBtn = this._modalEl.querySelector("[data-close]");
+    if (closeBtn) {
+      closeBtn.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        close();
+      });
+    }
+
+    this._modalEl.querySelector(".ssm-modal")?.addEventListener("pointerdown", (e) => {
+      e.stopPropagation();
+    });
 
     // Edit alias via prompt
     const editBtn = this._modalEl.querySelector("[data-alias-edit]");
     if (editBtn) {
-      editBtn.addEventListener("click", () => {
+      editBtn.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
         const current = attrs.Alias ?? "";
         const next = window.prompt("Set port alias", current);
         if (next === null) return; // cancelled
@@ -255,17 +286,22 @@ class SnmpSwitchManagerCard extends HTMLElement {
       });
     }
 
-    this._modalEl.querySelector(".btn.wide")?.addEventListener("click",(ev)=>{
-      const id=ev.currentTarget.getAttribute("data-entity");
-      this._toggle(id);
-      setTimeout(()=>this._render(), 300);
-    });
+    const toggleBtn = this._modalEl.querySelector(".btn.wide");
+    if (toggleBtn) {
+      toggleBtn.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const id = ev.currentTarget.getAttribute("data-entity");
+        this._toggle(id);
+        setTimeout(() => this._render(), 300);
+      });
+    }
 
     // Append both style and modal
     this.shadowRoot.append(this._modalStyle, this._modalEl);
   }
 
-  async _render(){
+  async _render() {
     if (!this.shadowRoot || !this._config || !this._hass) return;
 
     const data = await this._discoverEntities(); if (!data) return;
@@ -305,13 +341,13 @@ class SnmpSwitchManagerCard extends HTMLElement {
       svg { display:block; }
       .label { font-size: ${this._config.label_size}px; fill: var(--primary-text-color); opacity:.85; }
       .panel-wrap { border-radius:12px; border:1px solid var(--divider-color);
-        padding:6px; background: color-mix(in oklab, var(--ha-card-background, #1f2937) 75%, transparent); }
+        padding:6; background: color-mix(in oklab, var(--ha-card-background, #1f2937) 75%, transparent); }
     `;
 
     const header = this._config.title ? `<div class="head">${this._config.title}</div>` : "";
 
     if (diag && !phys.length && !virt.length && !this._config.ports) {
-      const diagList = diag.map(id=>`<code>${id}</code>`).join(", ");
+      const diagList = diag.map(id => `<code>${id}</code>`).join(", ");
       this.shadowRoot.innerHTML = `
         <ha-card>
           <style>${style}</style>
@@ -331,11 +367,11 @@ class SnmpSwitchManagerCard extends HTMLElement {
     const infoGrid = (() => {
       const diagBox = (() => {
         if (!this._config.diagnostics?.length) return "";
-        const H=this._hass?.states||{};
-        const rows=this._config.diagnostics.map(id=>{
-          const st=H[id]; if(!st) return null;
-          const name=st.attributes?.friendly_name||id;
-          const value=typeof st.state==="string"?st.state:JSON.stringify(st.state);
+        const H = this._hass?.states || {};
+        const rows = this._config.diagnostics.map(id => {
+          const st = H[id]; if (!st) return null;
+          const name = st.attributes?.friendly_name || id;
+          const value = typeof st.state === "string" ? st.state : JSON.stringify(st.state);
           return `<div class="diag-row"><span class="diag-name">${name}</span><span class="diag-val">${value}</span></div>`;
         }).filter(Boolean).join("");
         if (!rows) return "";
@@ -344,9 +380,9 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
       const virtBox = (() => {
         if (!virt.length) return "";
-        const rows = virt.map(([id, st])=>{
-          const n=st.attributes?.Name || id.split(".")[1] || id;
-          const ip=st.attributes?.IP ? ` — ${st.attributes.IP}` : "";
+        const rows = virt.map(([id, st]) => {
+          const n = st.attributes?.Name || id.split(".")[1] || id;
+          const ip = st.attributes?.IP ? ` — ${st.attributes.IP}` : "";
           return `<div class="virt-row">
             <span class="dot" style="background:${this._colorFor(st)}"></span>
             <span>${n}${ip}</span>
@@ -361,9 +397,9 @@ class SnmpSwitchManagerCard extends HTMLElement {
     })();
 
     const listView = () => {
-      const grid = phys.map(([id, st])=>{
-        const a=st.attributes||{};
-        const name=a.Name || id.split(".")[1];
+      const grid = phys.map(([id, st]) => {
+        const a = st.attributes || {};
+        const name = a.Name || id.split(".")[1];
         const ip = a.IP ? ` • IP: ${a.IP}` : "";
         const aliasText = a.Alias ? `Alias: ${a.Alias}` : "";
         const title = aliasText || name;
@@ -377,34 +413,36 @@ class SnmpSwitchManagerCard extends HTMLElement {
       }).join("");
 
       return `
-        ${this._config.info_position==="above" ? infoGrid : ""}
+        ${this._config.info_position === "above" ? infoGrid : ""}
         <div class="section">
           ${phys.length ? `<div class="grid">${grid}</div>` : `<div class="hint">No physical ports discovered.</div>`}
         </div>
-        ${this._config.info_position==="below" ? infoGrid : ""}`;
+        ${this._config.info_position === "below" ? infoGrid : ""}`;
     };
 
     const panelView = () => {
-      const P=this._config.port_size, G=this._config.gap, perRow=Math.max(1,this._config.ports_per_row);
-      const rows=Math.max(1, Math.ceil((phys.length||perRow)/perRow));
-      const W=this._config.panel_width;
-      const topPad=24, sidePad=28, rowPad=(this._config.show_labels? (this._config.label_size+14):18);
-      const H=20+topPad+rows*(P+G)+rowPad;
-      const plate = `<rect x="10" y="10" width="${W-20}" height="${H-20}" rx="8"
+      const P = this._config.port_size;
+      const G = this._config.gap;
+      const perRow = Math.max(1, this._config.ports_per_row);
+      const rows = Math.max(1, Math.ceil((phys.length || perRow) / perRow));
+      const W = this._config.panel_width;
+      const topPad = 24, sidePad = 28, rowPad = (this._config.show_labels ? (this._config.label_size + 14) : 18);
+      const H = 20 + topPad + rows * (P + G) + rowPad;
+      const plate = `<rect x="10" y="10" width="${W - 20}" height="${H - 20}" rx="8"
         fill="var(--ha-card-background, #1f2937)" stroke="var(--divider-color, #4b5563)"/>`;
-      const usableW=W-2*sidePad, slotW=usableW/perRow;
+      const usableW = W - 2 * sidePad, slotW = usableW / perRow;
 
-      const rects = phys.map(([id, st], i)=>{
+      const rects = phys.map(([id, st], i) => {
         const name = String(st.attributes?.Name || id.split(".")[1] || "");
-        const idx=i%perRow, row=Math.floor(i/perRow);
-        const x=sidePad+idx*slotW+(slotW-P)/2, y=topPad+row*(P+G)+18;
-        const fill=this._colorFor(st);
+        const idx = i % perRow, row = Math.floor(i / perRow);
+        const x = sidePad + idx * slotW + (slotW - P) / 2, y = topPad + row * (P + G) + 18;
+        const fill = this._colorFor(st);
         const label = this._config.show_labels
-          ? `<text class="label" x="${x+P/2}" y="${y+P+this._config.label_size}" text-anchor="middle">${name}</text>`
+          ? `<text class="label" x="${x + P / 2}" y="${y + P + this._config.label_size}" text-anchor="middle">${name}</text>`
           : "";
         return `
           <g class="port-svg" data-entity="${id}" tabindex="0" style="cursor:pointer">
-            <rect x="${x}" y="${y}" width="${P}" height="${P}" rx="${Math.round(P*0.2)}"
+            <rect x="${x}" y="${y}" width="${P}" height="${P}" rx="${Math.round(P * 0.2)}"
               fill="${fill}" stroke="rgba(0,0,0,.35)"/>
             ${label}
           </g>`;
@@ -419,9 +457,9 @@ class SnmpSwitchManagerCard extends HTMLElement {
         </div>`;
 
       return `
-        ${this._config.info_position==="above" ? infoGrid : ""}
+        ${this._config.info_position === "above" ? infoGrid : ""}
         <div class="panel">${svg}</div>
-        ${this._config.info_position==="below" ? infoGrid : ""}`;
+        ${this._config.info_position === "below" ? infoGrid : ""}`;
     };
 
     const body = this._config.view === "panel" ? panelView() : listView();
@@ -434,24 +472,27 @@ class SnmpSwitchManagerCard extends HTMLElement {
       </ha-card>
     `;
 
-    // wire list buttons
-    this.shadowRoot.querySelectorAll(".btn[data-entity]").forEach(btn=>{
-      btn.addEventListener("click",(ev)=>{
-        const id=ev.currentTarget.getAttribute("data-entity");
+    // wire list buttons (virtual + physical) — still use click here
+    this.shadowRoot.querySelectorAll(".btn[data-entity]").forEach(btn => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const id = ev.currentTarget.getAttribute("data-entity");
         if (id) this._toggle(id);
       });
     });
 
-    // wire panel ports -> modal
-    this.shadowRoot.querySelectorAll(".port-svg[data-entity]").forEach(g=>{
-      g.addEventListener("click",(ev)=>{
-        const id=ev.currentTarget.getAttribute("data-entity");
+    // wire panel ports -> modal (use pointerdown for reliability)
+    this.shadowRoot.querySelectorAll(".port-svg[data-entity]").forEach(g => {
+      g.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const id = ev.currentTarget.getAttribute("data-entity");
         if (id) this._openDialog(id);
       });
-      g.addEventListener("keypress",(ev)=>{
-        if (ev.key==="Enter" || ev.key===" ") {
+      g.addEventListener("keypress", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
           ev.preventDefault();
-          const id=ev.currentTarget.getAttribute("data-entity");
+          const id = ev.currentTarget.getAttribute("data-entity");
           if (id) this._openDialog(id);
         }
       });
