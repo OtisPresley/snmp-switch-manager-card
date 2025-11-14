@@ -49,9 +49,18 @@ A lovelace card to be used with the [SNMP Switch Manager](https://github.com/Oti
     gap: 10
    ```
 
-   The `anchor_entity` is any entity in your switch so it knows which ports and diagnostics to display.
+   The follows are descriptions of the settings:
+   - `title` sets the text displayed at the tip of the card.
+   - `view` sets the style that the card uses. `list` lists each port in a tile. `panel` show a representation of the front of a switch.
+   - `ports_per_row` sets the number of ports to show in each row on the card when in panel view.
+   - `info_position` displays the Diagnostics and Virtual Interfaces either `above` the phisical ports or `below` them.
+   - `label_size` determines the font size used for the port labels when in panel view.
+   - `anchor_entity` is any entity in your switch so it knows which ports and diagnostics to display.
+   - `diagnostics` is a list of sensors you want to display in the diagnostics area.
+   - `port_size` determines the size of the port images when in panel view.
+   - `gap` determines how far apart the ports are when in panel view.
    
-   Clicking a port opens a dialog with quick actions to toggle the port or edit its description. There is also an alternative `list` view depicted in the      third image below.
+   Clicking a port opens a dialog with quick actions to toggle the port or edit its description. The alternative `list` view depicted in the third image below.
 
     <p float="left">
       <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot2.png" alt="Screenshot 1" width="250"/>
