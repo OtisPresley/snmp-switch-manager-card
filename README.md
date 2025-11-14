@@ -45,6 +45,8 @@ A lovelace card to be used with the [SNMP Switch Manager](https://github.com/Oti
       - sensor.manufacturer
       - sensor.model
       - sensor.uptime
+    port_size: 18
+    gap: 10
    ```
 
    The `anchor_entity` is any entity in your switch so it knows which ports and diagnostics to display.
