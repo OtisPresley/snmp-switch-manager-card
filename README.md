@@ -35,9 +35,9 @@ A lovelace card to be used with the [SNMP Switch Manager](https://github.com/Oti
     type: custom:snmp-switch-manager-card
     title: Core Switch
     view: panel
-    ports_per_row: 12
+    ports_per_row: 24
     info_position: below
-    label_size: 8
+    label_size: 6
     anchor_entity: switch.gi1_0_1
     diagnostics:
       - sensor.hostname
