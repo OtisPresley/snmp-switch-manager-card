@@ -138,8 +138,10 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
     const phys = [], virt = [];
     for (const [id, st] of entries) {
-      const n = String(st.attributes?.Name || id.split(".")[1] || "").toUpperCase();
-      if (/^(GI|TE|TW|SLOT)/.test(n) || /^switch\.(gi|te|tw)\d+_\d+_\d+$/i.test(id)) phys.push([id, st]);
+      const nRaw = String(st.attributes?.Name || id.split(".")[1] || "");
+      const n = nRaw.toUpperCase();
+      const isPhysical = /^(GI|TE|TW)/.test(n) || n.startsWith("SLOT") || /^switch\.(gi|te|tw)\d+_\d+_\d+$/i.test(id);
+      if (isPhysical) phys.push([id, st]);
       else virt.push([id, st]);
     }
 
@@ -419,3 +421,154 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
       if (!diagBox && !virtBox) return "";
       return `<div class="info-grid">${diagBox}${virtBox}</div>`;
+    })();
+
+    const listView = () => {
+      const grid = phys.map(([id, st]) => {
+        const a = st.attributes || {};
+        const name = a.Name || id.split(".")[1];
+        const ip = a.IP ? ` • IP: ${a.IP}` : "";
+        const alias = a.Alias;
+        const titleParts = [];
+        if (alias) titleParts.push(`Alias: ${alias}`);
+        titleParts.push(`${name}${ip}`);
+        const title = titleParts.join(" • ");
+        return `<div class="port" title="${title}">
+          <div class="name" data-alias-entity="${id}">${name}</div>
+          <div class="kv"><span class="dot" style="background:${this._colorFor(st)}"></span>
+            Admin: ${a.Admin ?? "-"} • Oper: ${a.Oper ?? "-"}${ip}
+          </div>
+          <button class="btn wide" data-entity="${id}">${this._buttonLabel(st)}</button>
+        </div>`;
+      }).join("");
+
+      return `
+        ${this._config.info_position === "above" ? infoGrid : ""}
+        <div class="section">
+          ${phys.length ? `<div class="grid">${grid}</div>` : `<div class="hint">No physical ports discovered.</div>`}
+        </div>
+        ${this._config.info_position === "below" ? infoGrid : ""}`;
+    };
+
+    const panelView = () => {
+      const P = this._config.port_size;
+      const G = this._config.gap;
+      const perRow = Math.max(1, this._config.ports_per_row);
+      const rows = Math.max(1, Math.ceil((phys.length || perRow) / perRow));
+      const W = this._config.panel_width;
+      const topPad = 24, sidePad = 28, rowPad = (this._config.show_labels ? (this._config.label_size + 14) : 18);
+      const H = 20 + topPad + rows * (P + G) + rowPad;
+      const plate = `<rect x="10" y="10" width="${W - 20}" height="${H - 20}" rx="8"
+        fill="var(--ha-card-background, #1f2937)" stroke="var(--divider-color, #4b5563)"/>`;
+      const usableW = W - 2 * sidePad, slotW = usableW / perRow;
+
+      const rects = phys.map(([id, st], i) => {
+        const a = st.attributes || {};
+        const name = String(a.Name || id.split(".")[1] || "");
+        const alias = a.Alias;
+        const idx = i % perRow, row = Math.floor(i / perRow);
+        const x = sidePad + idx * slotW + (slotW - P) / 2, y = topPad + row * (P + G) + 18;
+        const fill = this._colorFor(st);
+        const label = this._config.show_labels
+          ? `<text class="label" x="${x + P / 2}" y="${y + P + this._config.label_size}" text-anchor="middle">${name}</text>`
+          : "";
+        const titleParts = [];
+        if (alias) titleParts.push(`Alias: ${alias}`);
+        titleParts.push(name);
+        const title = this._htmlEscape(titleParts.join(" • "));
+        return `
+          <g class="port-svg" data-entity="${id}" tabindex="0" style="cursor:pointer">
+            <title>${title}</title>
+            <rect x="${x}" y="${y}" width="${P}" height="${P}" rx="${Math.round(P * 0.2)}"
+              fill="${fill}" stroke="rgba(0,0,0,.35)"/>
+            ${label}
+          </g>`;
+      }).join("");
+
+      const svg = `
+        <div class="panel-wrap">
+          <svg viewBox="0 0 ${W} ${H}" width="100%" height="auto" preserveAspectRatio="xMidYMid meet">
+            ${plate}
+            ${rects}
+          </svg>
+        </div>`;
+
+      return `
+        ${this._config.info_position === "above" ? infoGrid : ""}
+        <div class="panel">${svg}</div>
+        ${this._config.info_position === "below" ? infoGrid : ""}`;
+    };
+
+    const body = this._config.view === "panel" ? panelView() : listView();
+
+    this.shadowRoot.innerHTML = `
+      <ha-card>
+        <style>${style}</style>
+        ${header}
+        ${body}
+      </ha-card>
+    `;
+
+    // wire list + virtual toggle buttons (keep click)
+    this.shadowRoot.querySelectorAll(".btn[data-entity]").forEach(btn => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const id = ev.currentTarget.getAttribute("data-entity");
+        if (id) this._toggle(id);
+      });
+    });
+
+    // alias editing from names (list + virtual) — use pointerdown for reliability
+    this.shadowRoot.querySelectorAll("[data-alias-entity]").forEach(el => {
+      el.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const id = el.getAttribute("data-alias-entity");
+        if (!id) return;
+        const st = this._hass?.states?.[id];
+        const currentAlias = st?.attributes?.Alias;
+        this._promptAlias(id, currentAlias);
+      });
+      el.addEventListener("keypress", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          const id = el.getAttribute("data-alias-entity");
+          if (!id) return;
+          const st = this._hass?.states?.[id];
+          const currentAlias = st?.attributes?.Alias;
+          this._promptAlias(id, currentAlias);
+        }
+      });
+    });
+
+    // wire panel ports -> modal (pointerdown for reliability)
+    this.shadowRoot.querySelectorAll(".port-svg[data-entity]").forEach(g => {
+      g.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const id = g.getAttribute("data-entity");
+        if (id) this._openDialog(id);
+      });
+      g.addEventListener("keypress", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          const id = g.getAttribute("data-entity");
+          if (id) this._openDialog(id);
+        }
+      });
+    });
+
+    // Re-attach modal AND style if they exist (so it stays styled and centered)
+    if (this._modalStyle) this.shadowRoot.append(this._modalStyle);
+    if (this._modalEl) this.shadowRoot.append(this._modalEl);
+  }
+}
+
+customElements.define("snmp-switch-manager-card", SnmpSwitchManagerCard);
+window.customCards = window.customCards || [];
+window.customCards.push({
+  type: "snmp-switch-manager-card",
+  name: "SNMP Switch Manager Card",
+  description: "Auto-discovers SNMP Switch Manager ports with panel/list views, safe modal toggles, and diagnostics.",
+  preview: true
+});
