@@ -451,10 +451,15 @@ class SnmpSwitchManagerCard extends HTMLElement {
     };
 
     const panelView = () => {
+      // Prefer physical ports, but if none were discovered fall back to virtual
+      // so devices whose ports are only exposed as "virtual" (e.g. D-Link Slot0/x)
+      // still render correctly in panel mode.
+      const panelPorts = phys.length ? phys : virt;
+
       const P = this._config.port_size;
       const G = this._config.gap;
       const perRow = Math.max(1, this._config.ports_per_row);
-      const rows = Math.max(1, Math.ceil((phys.length || perRow) / perRow));
+      const rows = Math.max(1, Math.ceil((panelPorts.length || perRow) / perRow));
       const W = this._config.panel_width;
       const topPad = 24, sidePad = 28, rowPad = (this._config.show_labels ? (this._config.label_size + 14) : 18);
       const H = 20 + topPad + rows * (P + G) + rowPad;
@@ -462,7 +467,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
         fill="var(--ha-card-background, #1f2937)" stroke="var(--divider-color, #4b5563)"/>`;
       const usableW = W - 2 * sidePad, slotW = usableW / perRow;
 
-      const rects = phys.map(([id, st], i) => {
+      const rects = panelPorts.map(([id, st], i) => {
         const a = st.attributes || {};
         const name = String(a.Name || id.split(".")[1] || "");
         const alias = a.Alias;
