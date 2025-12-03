@@ -10,7 +10,20 @@ A lovelace card to be used with the [SNMP Switch Manager](https://github.com/Oti
 
 ---
 
-## Installation and Configuration
+## Installation
+
+### HACS (recommended)
+
+You can install this card directly from HACS:
+
+[![Open your Home Assistant instance and show the repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=OtisPresley&repository=snmp-switch-manager-card)
+
+After installation, restart Home Assistant. The card will then be available
+as **Custom: SNMP Switch Manager Card** when adding a card in your dashboard.
+
+---
+
+### Manual installation
 
 1. Download the `snmp-switch-manager-card.js` and  `snmp-switch-manager-card-editor.js` files and place them in `www/community/snmp-switch-manager-card/` in Home Assistant.
 
@@ -25,8 +38,11 @@ A lovelace card to be used with the [SNMP Switch Manager](https://github.com/Oti
    url: /local/community/snmp-switch-manager-card/snmp-switch-manager-card-editor.js
    type: module
    ```
+---
 
-3. Place the card on any dashboard and edit via the GUI or in YAML:
+## Configuration
+
+1. Place the card on any dashboard and edit via the GUI or in YAML:
    <p float="left">
       <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot1.png" alt="Screenshot 1" width="250"/>
    </p>
