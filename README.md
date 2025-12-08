@@ -18,6 +18,13 @@ You can install this card directly from HACS:
 
 [![Open your Home Assistant instance and show the repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=OtisPresley&repository=snmp-switch-manager-card)
 
+Add the editor JavaScript as a resource under **Settings → Dashboards → Resources**:
+
+   ```yaml
+   url: /hacsfiles/snmp-switch-manager-card/snmp-switch-manager-card-editor.js
+   type: module
+   ```
+
 After installation, restart Home Assistant. The card will then be available
 
 as **Custom: SNMP Switch Manager Card** when adding a card in your dashboard.
