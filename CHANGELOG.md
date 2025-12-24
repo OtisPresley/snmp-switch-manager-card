@@ -27,3 +27,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 🧩 Eliminated the need for multiple Lovelace resource URLs by embedding the editor into the main card
 
 ---
+
+## [0.3.0] - 2025-01-xx
+### Added
+- 🧭 **Device-based card configuration**
+  - Card now targets a selected **SNMP Switch Manager device** instead of anchor entities or name filters
+  - Device selector is populated directly from the Home Assistant **Device Registry**
+- 🧠 **Automatic Diagnostics discovery**
+  - Diagnostics panel now auto-discovers:
+    - Hostname
+    - Manufacturer
+    - Model
+    - Firmware Revision
+    - Uptime
+- 🔀 **Reorderable Diagnostics**
+  - Diagnostics display order can be customized directly in the card editor
+- ⚡ **Live port toggle feedback**
+  - “Turn on / Turn off” button in the port popup updates immediately when port state changes
+
+### Changed
+- 🧩 **Removed legacy configuration fields**
+  - `anchor_entity`, `device_name`, `unit`, and `slot` are no longer required or shown in the editor
+- 🧰 **Diagnostics configuration simplified**
+  - Manual `diagnostics:` lists are no longer required; discovery is automatic
+
+### Fixed
+- 🔁 **Editor stability**
+  - Prevented continuous re-rendering that caused dropdowns to close unexpectedly
+- 🎛️ **Popup interaction reliability**
+  - Port state changes now update the popup UI without requiring it to be closed and reopened
+
+---
