@@ -3,7 +3,14 @@ class SnmpSwitchManagerCard extends HTMLElement {
     super();
     this.attachShadow({ mode: "open" });
     this._hass = null;
+
+        // SNMP Switch Manager devices (device registry)
+        this._snmpDevices = null; // [{id,name,prefix}]
+        this._loadingDevices = false;
     this._config = null;
+    this._hasHass = false;
+    this._hasConfig = false;
+    this._rendered = false;
 
     // Registries / scoping
     this._entityReg = null;
@@ -32,14 +39,28 @@ class SnmpSwitchManagerCard extends HTMLElement {
       // Scoping
       anchor_entity: config.anchor_entity ?? null,
       device_name: config.device_name ?? null,
+      device: config.device ?? null,
       unit: Number.isFinite(config.unit) ? Number(config.unit) : null,
       slot: Number.isFinite(config.slot) ? Number(config.slot) : null,
       ports: Array.isArray(config.ports) ? config.ports : null,
 
-      // Diagnostics sensor list
-      diagnostics: Array.isArray(config.diagnostics) ? config.diagnostics : [],
+      // Diagnostics are auto-discovered (Hostname/Manufacturer/Model/Firmware/Uptime)
+// Users can optionally reorder via diagnostics_order.
+      diagnostics_order: (Array.isArray(config.diagnostics_order) && config.diagnostics_order.length)
+        ? config.diagnostics_order
+        : (Array.isArray(config.diagnostics) && config.diagnostics.length)
+          ? (() => {
+              const known = ["hostname","manufacturer","model","firmware_revision","uptime"];
+              const out = [];
+              for (const id of config.diagnostics) {
+                const m = String(id).match(/_(hostname|manufacturer|model|firmware_revision|uptime)$/);
+                if (m && !out.includes(m[1])) out.push(m[1]);
+              }
+              for (const k of known) if (!out.includes(k)) out.push(k);
+              return out;
+            })()
+          : ["hostname","manufacturer","model","firmware_revision","uptime"],
 
-      
       // Optional custom background image + port positioning (panel view only)
       background_image: (typeof config.background_image === "string" && config.background_image.trim()) ? config.background_image.trim() : null,
       ports_offset_x: Number.isFinite(config.ports_offset_x) ? Number(config.ports_offset_x) : 0,
@@ -56,6 +77,12 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+    // If a port dialog is open, keep its toggle label in sync with live state
+    if (this._modalEl && this._modalEntityId) {
+      const st = hass?.states?.[this._modalEntityId];
+      const btn = this._modalEl.querySelector('.ssm-modal-actions .btn.wide');
+      if (btn && st) btn.textContent = this._buttonLabel(st);
+    }
     this._render();
   }
 
@@ -96,6 +123,46 @@ class SnmpSwitchManagerCard extends HTMLElement {
     return k === "GI" ? 0 : k === "TE" ? 1 : k === "TW" ? 2 : 3;
   }
 
+
+  _inferDevicePrefix() {
+    const cfg = this._config || {};
+    if (cfg.device) return String(cfg.device);
+    const ae = cfg.anchor_entity ? String(cfg.anchor_entity) : "";
+    const ent = ae.includes(".") ? ae.split(".")[1] : "";
+    // Try to infer prefix from common port naming patterns: <prefix>_<kind><...>
+    const m = ent.match(/^(.+?)_(gi|fa|ge|te|tw|xe|et|eth|po|vlan|slot)\d/i);
+    if (m) return m[1];
+    // Fallback: first token before first underscore
+    return ent ? ent.split("_")[0] : "";
+  }
+
+  _getDiagnosticsEntityIds() {
+    const H = this._hass?.states || {};
+    const prefix = this._inferDevicePrefix();
+    if (!prefix) return [];
+    const def = ["hostname","manufacturer","model","firmware_revision","uptime"];
+    const order = (Array.isArray(this._config?.diagnostics_order) && this._config.diagnostics_order.length)
+      ? this._config.diagnostics_order
+      : def;
+    const out = [];
+    for (const key of order) {
+      const k = String(key || "");
+      if (!def.includes(k)) continue;
+      const eid = `sensor.${prefix}_${k}`;
+      if (H[eid]) out.push(eid);
+    }
+    return out;
+  }
+
+  _stripDiagPrefix(name) {
+    if (typeof name !== "string") return name;
+    const prefix = this._inferDevicePrefix();
+    if (!prefix) return name;
+    const cand = prefix.replace(/_/g, "-").toUpperCase();
+    const re = new RegExp("^" + cand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s+", "i");
+    return name.replace(re, "");
+  }
+
   _entityMatchesNameUnitSlot(id, st) {
     const attrs = st?.attributes || {};
     const name = String(attrs.Name || id.split(".")[1] || "");
@@ -133,6 +200,13 @@ class SnmpSwitchManagerCard extends HTMLElement {
             /^switch\.(?:gi|te|tw)\d+_\d+_\d+$/i.test(id) ||
             /^switch\.(?:vl\d+|lo\d+|po\d+)$/i.test(id);
           if (!looksRight) return false;
+
+          // Preferred scoping: device hostname prefix (switch.<device>_*)
+          if (this._config.device) {
+            const pref = `switch.${String(this._config.device)}_`;
+            if (!id.startsWith(pref)) return false;
+            return true;
+          }
 
           if (this._anchorDeviceId && this._entityReg) {
             const did = this._deviceIdForEntity(id);
@@ -238,6 +312,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
     // remove any prior modal/style
     this._modalEl?.remove(); this._modalStyle?.remove();
+    this._modalEntityId = entity_id;
 
     this._modalEl = document.createElement("div");
     this._modalEl.className = "ssm-modal-root";
@@ -285,6 +360,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
     const close = () => {
       this._modalEl?.remove(); this._modalStyle?.remove();
       this._modalEl = null; this._modalStyle = null;
+      this._modalEntityId = null;
     };
 
     const backdrop = this._modalEl.querySelector(".ssm-backdrop");
@@ -329,7 +405,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
         ev.stopPropagation();
         const id = ev.currentTarget.getAttribute("data-entity");
         this._toggle(id);
-        setTimeout(() => this._render(), 300);
+        // button label will update automatically on next hass state change
       });
     }
 
@@ -407,16 +483,14 @@ class SnmpSwitchManagerCard extends HTMLElement {
     const infoGrid = (() => {
       const diagBox = (() => {
         if (this._config.hide_diagnostics) return "";
-        if (!this._config.diagnostics?.length) return "";
+        const diagIds = this._getDiagnosticsEntityIds();
+        if (!diagIds.length) return "";
         const H = this._hass?.states || {};
-        const rows = this._config.diagnostics.map(id => {
+        const rows = diagIds.map(id => {
           const st = H[id]; if (!st) return null;
           let name = st.attributes?.friendly_name || id;
-          // Friendly names often include the device name prefix (e.g. "SWITCH-XYZ Hostname"); strip it for display.
-          if (this._config.device_name && typeof name === "string") {
-            const prefix = `${this._config.device_name} `;
-            if (name.startsWith(prefix)) name = name.slice(prefix.length);
-          }
+          // Friendly names often include the device prefix (e.g. "SWITCH-XYZ Hostname"); strip it for display.
+          name = this._stripDiagPrefix(name);
           const value = typeof st.state === "string" ? st.state : JSON.stringify(st.state);
           return `<div class="diag-row"><span class="diag-name">${name}</span><span class="diag-val">${value}</span></div>`;
         }).filter(Boolean).join("");
@@ -657,6 +731,7 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
         info_position: "above",
         hide_diagnostics: false,
         hide_virtual_interfaces: false,
+        device: null,
       });
     }
 
@@ -674,24 +749,115 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
       }
 
       set hass(hass) {
-        // We keep hass so we match the editor API, even though we
-        // no longer use HA's internal picker components.
+        // Keep hass (editor API) but avoid re-rendering on every state change,
+        // which causes the <select> dropdown to collapse while the user is interacting.
+        const first = !this._hasHass;
         this._hass = hass;
         this._hasHass = true;
+
+        // Only load device list once per editor instance.
+        if (first) {
+          this._loadSnmpDevices();
+        }
+
+        // Render once when we have both hass and config.
         if (this._hasConfig && !this._rendered) {
           this._render();
+          this._rendered = true;
         }
       }
 
       setConfig(config) {
         this._config = { ...config };
         this._hasConfig = true;
-        if (this._hasHass && !this._rendered) {
+        // Re-render when config changes (YAML/editor), but avoid frequent re-renders from hass updates.
+        this._rendered = false;
+        if (this._hasHass) {
           this._render();
+          this._rendered = true;
         }
       }
 
       // ---- helpers ----
+
+async _loadSnmpDevices() {
+  if (this._loadingDevices) return;
+  if (!this._hass) return;
+
+  // Cache once per editor instance; keep it simple & robust.
+  if (Array.isArray(this._snmpDevices)) return;
+
+  this._loadingDevices = true;
+  try {
+    // 1) Find SNMP Switch Manager config entry ids
+    const entries = await this._hass.callWS({ type: "config_entries/get" });
+    const entryIds = (entries || [])
+      .filter(e => e && e.domain === "snmp_switch_manager")
+      .map(e => e.entry_id);
+
+    // 2) List devices and filter to those attached to the SNMP Switch Manager entries
+    const devices = await this._hass.callWS({ type: "config/device_registry/list" });
+    const snmpDevices = (devices || []).filter(d =>
+      Array.isArray(d?.config_entries) && d.config_entries.some(id => entryIds.includes(id))
+    );
+
+    // 3) Map device -> hostname prefix by looking at entity registry entries attached to that device
+    //    (We only need a stable prefix so the card can scope ports/sensors by entity_id.)
+    const entityReg = await this._hass.callWS({ type: "config/entity_registry/list" });
+    const byDevice = new Map();
+    for (const ent of (entityReg || [])) {
+      const did = ent?.device_id;
+      const eid = ent?.entity_id;
+      if (!did || !eid) continue;
+      if (!byDevice.has(did)) byDevice.set(did, []);
+      byDevice.get(did).push(eid);
+    }
+
+    const result = [];
+    for (const d of snmpDevices) {
+      const id = d.id;
+      const name = d.name_by_user || d.name || id;
+
+      // Prefer a hostname sensor if present; else fall back to a switch entity.
+      const eids = byDevice.get(id) || [];
+      let prefix = "";
+      for (const eid of eids) {
+        const m = String(eid).match(/^sensor\.([a-z0-9_]+)_hostname$/i);
+        if (m) { prefix = m[1]; break; }
+      }
+      if (!prefix) {
+        for (const eid of eids) {
+          const m = String(eid).match(/^switch\.([a-z0-9_]+)_/i);
+          if (m) { prefix = m[1]; break; }
+        }
+      }
+
+      // If we can't derive a prefix, skip it (prevents "empty selection" that breaks scoping).
+      if (!prefix) continue;
+
+      result.push({ id, name, prefix });
+    }
+
+    result.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+    this._snmpDevices = result;
+  } catch (err) {
+    // If anything fails, keep an empty list (but do not break the card/editor).
+    // eslint-disable-next-line no-console
+    console.warn("SNMP Switch Manager Card: failed to load devices", err);
+    this._snmpDevices = [];
+  } finally {
+    this._loadingDevices = false;
+    // Re-render once after devices load; do not flip _rendered back to false.
+    this._render();
+  }
+}
+
+_listDevicesFromHass() {
+  // Back-compat fallback: return any cached SNMP devices prefixes.
+  const list = Array.isArray(this._snmpDevices) ? this._snmpDevices : [];
+  return list.map(d => d.prefix);
+}
+
       _escape(str) {
         if (str == null) return "";
         return String(str)
@@ -718,14 +884,15 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
       _render() {
         if (!this.shadowRoot) return;
         const c = this._config || {};
+        const devices = Array.isArray(this._snmpDevices) ? this._snmpDevices : [];
+        const deviceOptions = devices.map(d => {
+          const sel = String(c.device || "") === String(d.prefix) ? " selected" : "";
+          return `<option value="${this._escape(d.prefix)}"${sel}>${this._escape(d.name)}</option>`;
+        }).join("");
 
         const portsText = Array.isArray(c.ports)
           ? c.ports.join("\n")
           : (typeof c.ports === "string" ? c.ports : "");
-
-        const diagText = Array.isArray(c.diagnostics)
-          ? c.diagnostics.join("\n")
-          : (typeof c.diagnostics === "string" ? c.diagnostics : "");
 
         this.shadowRoot.innerHTML = `
           <style>
@@ -769,7 +936,13 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
               font-size: 12px;
               opacity: 0.8;
             }
-          </style>
+          
+            .diaglist { display:flex; flex-direction:column; gap:6px; width:100%; }
+            .diagitem { display:flex; align-items:center; justify-content:space-between; border:1px solid var(--divider-color); border-radius:6px; padding:6px 8px; }
+            .diagname { font-size: 14px; }
+            .diagbtns { display:flex; gap:6px; }
+            .diagbtns button { cursor:pointer; padding:2px 8px; border:1px solid var(--divider-color); border-radius:6px; background: var(--card-background-color); color: var(--primary-text-color); }
+</style>
           <div class="form">
             <div class="row">
               <label for="title">Title</label>
@@ -793,31 +966,17 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
               </div>
             </div>
 
-            <div class="row">
-              <label for="anchor_entity">Anchor entity (switch.* on target device)</label>
-              <input
-                id="anchor_entity"
-                type="text"
-                placeholder="switch.gi1_0_1"
-                value="${this._escape(c.anchor_entity || "") }"
-              >
-              <div class="hint">Used to scope auto-discovery to a specific switch device.</div>
-            </div>
 
-            <div class="two-col">
-              <div class="row">
-                <label for="device_name">Device name filter (optional)</label>
-                <input id="device_name" type="text" value="${this._escape(c.device_name || "")}">
-              </div>
-              <div class="row">
-                <label>Unit / Slot (optional)</label>
-                <div class="two-col">
-                  <input id="unit" type="number" placeholder="Unit" value="${c.unit != null ? Number(c.unit) : ""}">
-                  <input id="slot" type="number" placeholder="Slot" value="${c.slot != null ? Number(c.slot) : ""}">
-                </div>
-              </div>
-            </div>
+<div class="row">
+  <label for="device">Switch device</label>
+  <select id="device">
+    <option value="">Select a device…</option>
+    ${deviceOptions}
+  </select>
+  <div class="hint">Select a SNMP Switch Manager device (derived from entity ID prefixes).</div>
+</div>
 
+            </div>
             <div class="two-col">
               <div class="row">
                 <label for="ports_per_row">Ports per row (panel)</label>
@@ -898,12 +1057,32 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
             </div>
 
             <div class="row">
-              <label for="diagnostics">Diagnostics sensors (optional)</label>
-              <textarea
-                id="diagnostics"
-                placeholder="sensor.hostname\nsensor.model"
-              >${this._escape(diagText)}</textarea>
-              <div class="hint">One sensor entity ID per line, in display order.</div>
+              <label>Diagnostics order</label>
+              <div class="diaglist">
+                ${(["hostname","manufacturer","model","firmware_revision","uptime"]).map((k, i) => {
+                  const order = Array.isArray(c.diagnostics_order) && c.diagnostics_order.length
+                    ? c.diagnostics_order
+                    : ["hostname","manufacturer","model","firmware_revision","uptime"];
+                  const key = order[i] || k;
+                  const label = ({
+                    hostname: "Hostname",
+                    manufacturer: "Manufacturer",
+                    model: "Model",
+                    firmware_revision: "Firmware Revision",
+                    uptime: "Uptime"
+                  })[key] || key;
+                  return `
+                    <div class="diagitem">
+                      <span class="diagname">${this._escape(label)}</span>
+                      <div class="diagbtns">
+                        <button class="diagup" data-idx="${i}" title="Move up">▲</button>
+                        <button class="diagdown" data-idx="${i}" title="Move down">▼</button>
+                      </div>
+                    </div>
+                  `;
+                }).join("")}
+              </div>
+              <div class="hint">Diagnostics sensors are discovered automatically for the selected device (Hostname, Manufacturer, Model, Firmware Revision, Uptime). Use the arrows to reorder.</div>
             </div>
           </div>
         `;
@@ -928,28 +1107,12 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
           );
         });
 
-        // Anchor entity
-        root.getElementById("anchor_entity")?.addEventListener("input", (ev) => {
-          const val = ev.target.value.trim();
-          this._updateConfig("anchor_entity", val || null);
-        });
 
-        // Device name
-        root.getElementById("device_name")?.addEventListener("input", (ev) => {
-          const val = ev.target.value.trim();
-          this._updateConfig("device_name", val || null);
-        });
-
-        // Unit / Slot
-        root.getElementById("unit")?.addEventListener("change", (ev) => {
-          const v = parseInt(ev.target.value, 10);
-          this._updateConfig("unit", Number.isFinite(v) ? v : null);
-        });
-        root.getElementById("slot")?.addEventListener("change", (ev) => {
-          const v = parseInt(ev.target.value, 10);
-          this._updateConfig("slot", Number.isFinite(v) ? v : null);
-        });
-
+// Switch device
+root.getElementById("device")?.addEventListener("change", (ev) => {
+  const val = String(ev.target.value || "").trim();
+  this._updateConfig("device", val || null);
+});
         // Ports per row
         root.getElementById("ports_per_row")?.addEventListener("change", (ev) => {
           const v = parseInt(ev.target.value, 10);
@@ -1031,18 +1194,35 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
             .filter((ln) => ln.length > 0);
           this._updateConfig("ports", list.length ? list : null);
         });
-
-        // Diagnostics textarea
-        root.getElementById("diagnostics")?.addEventListener("input", (ev) => {
-          const text = ev.target.value || "";
-          const list = text
-            .split(/\r?\n/)
-            .map((ln) => ln.trim())
-            .filter((ln) => ln.length > 0);
-          this._updateConfig("diagnostics", list);
+        // Diagnostics order (auto-discovered sensors)
+        const moveDiag = (from, to) => {
+          const def = ["hostname","manufacturer","model","firmware_revision","uptime"];
+          const order = Array.isArray(this._config.diagnostics_order) && this._config.diagnostics_order.length
+            ? [...this._config.diagnostics_order]
+            : [...def];
+          if (from < 0 || from >= order.length || to < 0 || to >= order.length) return;
+          const [it] = order.splice(from, 1);
+          order.splice(to, 0, it);
+          this._updateConfig("diagnostics_order", order);
+        };
+        root.querySelectorAll("button.diagup").forEach((btn) => {
+          btn.addEventListener("click", (ev) => {
+            ev.preventDefault();
+            const idx = Number(btn.dataset.idx);
+            if (!Number.isFinite(idx)) return;
+            moveDiag(idx, idx - 1);
+          });
+        });
+        root.querySelectorAll("button.diagdown").forEach((btn) => {
+          btn.addEventListener("click", (ev) => {
+            ev.preventDefault();
+            const idx = Number(btn.dataset.idx);
+            if (!Number.isFinite(idx)) return;
+            moveDiag(idx, idx + 1);
+          });
         });
 
-        // Mark as rendered so we don't re-render on subsequent hass/setConfig calls
+// Mark as rendered so we don't re-render on subsequent hass/setConfig calls
         this._rendered = true;
       }
     }
