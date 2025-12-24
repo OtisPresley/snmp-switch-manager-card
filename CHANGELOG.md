@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.3.0] - 2025-01-xx
+## [0.3.0] - 2025-12-24
 ### Added
 - 🧭 **Device-based card configuration**
   - Card now targets a selected **SNMP Switch Manager device** instead of anchor entities or name filters
