@@ -38,6 +38,18 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
       // Diagnostics sensor list
       diagnostics: Array.isArray(config.diagnostics) ? config.diagnostics : [],
+
+      
+      // Optional custom background image + port positioning (panel view only)
+      background_image: (typeof config.background_image === "string" && config.background_image.trim()) ? config.background_image.trim() : null,
+      ports_offset_x: Number.isFinite(config.ports_offset_x) ? Number(config.ports_offset_x) : 0,
+      ports_offset_y: Number.isFinite(config.ports_offset_y) ? Number(config.ports_offset_y) : 0,
+      ports_scale: Number.isFinite(config.ports_scale) ? Number(config.ports_scale) : 1,
+      port_positions: (config.port_positions && typeof config.port_positions === "object") ? config.port_positions : null,
+
+// Optional panel visibility
+      hide_diagnostics: config.hide_diagnostics === true,
+      hide_virtual_interfaces: config.hide_virtual_interfaces === true,
     };
     this._render();
   }
@@ -220,6 +232,8 @@ class SnmpSwitchManagerCard extends HTMLElement {
     const attrs = st.attributes || {};
     const name = attrs.Name || entity_id.split(".")[1];
     const ip = attrs.IP ? `<div><b>IP:</b> ${attrs.IP}</div>` : "";
+    const speed = attrs.Speed ?? attrs.speed ?? attrs.ifSpeed;
+    const vlan = attrs["VLAN ID"] ?? attrs.vlan_id ?? attrs.VLAN_ID ?? attrs.VLAN ?? attrs.vlan;
     const aliasValue = attrs.Alias ?? "";
 
     // remove any prior modal/style
@@ -234,6 +248,8 @@ class SnmpSwitchManagerCard extends HTMLElement {
         <div class="ssm-modal-body">
           <div><b>Admin:</b> ${attrs.Admin ?? "-"}</div>
           <div><b>Oper:</b> ${attrs.Oper ?? "-"}</div>
+          <div><b>Speed:</b> ${speed ?? "-"}</div>
+          <div><b>VLAN ID:</b> ${vlan ?? "-"}</div>
           ${ip}
           <div><b>Index:</b> ${attrs.Index ?? "-"}</div>
           <div>
@@ -362,7 +378,10 @@ class SnmpSwitchManagerCard extends HTMLElement {
       svg { display:block; }
       .label { font-size: ${this._config.label_size}px; fill: var(--primary-text-color); opacity:.85; }
       .panel-wrap { border-radius:12px; border:1px solid var(--divider-color);
-        padding:6; background: color-mix(in oklab, var(--ha-card-background, #1f2937) 75%, transparent); }
+        /* Prefer HA theme vars; fall back to card background for themes that don't set --ha-card-background */
+        padding:6; background: color-mix(in oklab, var(--ha-card-background, var(--card-background-color, #1f2937)) 75%, transparent); }
+      .panel-wrap.bg { background-repeat:no-repeat; background-position:center; background-size:contain; }
+
     `;
 
     const header = this._config.title ? `<div class="head">${this._config.title}</div>` : "";
@@ -387,11 +406,17 @@ class SnmpSwitchManagerCard extends HTMLElement {
     // Info grid (Diagnostics + Virtual)
     const infoGrid = (() => {
       const diagBox = (() => {
+        if (this._config.hide_diagnostics) return "";
         if (!this._config.diagnostics?.length) return "";
         const H = this._hass?.states || {};
         const rows = this._config.diagnostics.map(id => {
           const st = H[id]; if (!st) return null;
-          const name = st.attributes?.friendly_name || id;
+          let name = st.attributes?.friendly_name || id;
+          // Friendly names often include the device name prefix (e.g. "SWITCH-XYZ Hostname"); strip it for display.
+          if (this._config.device_name && typeof name === "string") {
+            const prefix = `${this._config.device_name} `;
+            if (name.startsWith(prefix)) name = name.slice(prefix.length);
+          }
           const value = typeof st.state === "string" ? st.state : JSON.stringify(st.state);
           return `<div class="diag-row"><span class="diag-name">${name}</span><span class="diag-val">${value}</span></div>`;
         }).filter(Boolean).join("");
@@ -400,6 +425,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
       })();
 
       const virtBox = (() => {
+        if (this._config.hide_virtual_interfaces) return "";
         if (!virt.length) return "";
         const rows = virt.map(([id, st]) => {
           const a = st.attributes || {};
@@ -456,6 +482,13 @@ class SnmpSwitchManagerCard extends HTMLElement {
       // still render correctly in panel mode.
       const panelPorts = phys.length ? phys : virt;
 
+      const useBg = !!this._config.background_image;
+      const bgUrl = useBg ? this._htmlEscape(this._config.background_image) : "";
+      const scale = (Number.isFinite(this._config.ports_scale) && this._config.ports_scale > 0) ? this._config.ports_scale : 1;
+      const offX = Number.isFinite(this._config.ports_offset_x) ? this._config.ports_offset_x : 0;
+      const offY = Number.isFinite(this._config.ports_offset_y) ? this._config.ports_offset_y : 0;
+
+
       const P = this._config.port_size;
       const G = this._config.gap;
       const perRow = Math.max(1, this._config.ports_per_row);
@@ -463,9 +496,10 @@ class SnmpSwitchManagerCard extends HTMLElement {
       const W = this._config.panel_width;
       const topPad = 24, sidePad = 28, rowPad = (this._config.show_labels ? (this._config.label_size + 14) : 18);
       const H = 20 + topPad + rows * (P + G) + rowPad;
-      const plate = `<rect x="10" y="10" width="${W - 20}" height="${H - 20}" rx="8"
-        fill="var(--ha-card-background, #1f2937)" stroke="var(--divider-color, #4b5563)"/>`;
-      const usableW = W - 2 * sidePad, slotW = usableW / perRow;
+      const plate = useBg ? "" : `<rect x="10" y="10" width="${W - 20}" height="${H - 20}" rx="8"
+        fill="var(--ha-card-background, var(--card-background-color, #1f2937))" stroke="var(--divider-color, #4b5563)"/>`;
+
+const usableW = W - 2 * sidePad, slotW = usableW / perRow;
 
       const rects = panelPorts.map(([id, st], i) => {
         const a = st.attributes || {};
@@ -474,8 +508,9 @@ class SnmpSwitchManagerCard extends HTMLElement {
         const idx = i % perRow, row = Math.floor(i / perRow);
         const x = sidePad + idx * slotW + (slotW - P) / 2, y = topPad + row * (P + G) + 18;
         const fill = this._colorFor(st);
+        const Ps = P * scale;
         const label = this._config.show_labels
-          ? `<text class="label" x="${x + P / 2}" y="${y + P + this._config.label_size}" text-anchor="middle">${name}</text>`
+          ? `<text class="label" x="${x + Ps / 2}" y="${y + Ps + this._config.label_size}" text-anchor="middle">${name}</text>`
           : "";
         const titleParts = [];
         if (alias) titleParts.push(`Alias: ${alias}`);
@@ -484,14 +519,14 @@ class SnmpSwitchManagerCard extends HTMLElement {
         return `
           <g class="port-svg" data-entity="${id}" tabindex="0" style="cursor:pointer">
             <title>${title}</title>
-            <rect x="${x}" y="${y}" width="${P}" height="${P}" rx="${Math.round(P * 0.2)}"
+            <rect x="${x}" y="${y}" width="${Ps}" height="${Ps}" rx="${Math.round(Ps * 0.2)}"
               fill="${fill}" stroke="rgba(0,0,0,.35)"/>
             ${label}
           </g>`;
       }).join("");
 
       const svg = `
-        <div class="panel-wrap">
+        <div class="panel-wrap${useBg ? " bg" : ""}"${useBg ? ` style="background-image:url(${bgUrl})"` : ""}>
           <svg viewBox="0 0 ${W} ${H}" width="100%" height="auto" preserveAspectRatio="xMidYMid meet">
             ${plate}
             ${rects}
@@ -523,13 +558,17 @@ class SnmpSwitchManagerCard extends HTMLElement {
       });
     });
 
-    // alias editing from names (list + virtual) — use pointerdown for reliability
+    // list + virtual name click: list opens the same modal as panel; virtual keeps alias prompt
     this.shadowRoot.querySelectorAll("[data-alias-entity]").forEach(el => {
       el.addEventListener("pointerdown", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
         const id = el.getAttribute("data-alias-entity");
         if (!id) return;
+        if (el.classList.contains("name")) {
+          this._openDialog(id);
+          return;
+        }
         const st = this._hass?.states?.[id];
         const currentAlias = st?.attributes?.Alias;
         this._promptAlias(id, currentAlias);
@@ -539,6 +578,10 @@ class SnmpSwitchManagerCard extends HTMLElement {
           ev.preventDefault();
           const id = el.getAttribute("data-alias-entity");
           if (!id) return;
+          if (el.classList.contains("name")) {
+            this._openDialog(id);
+            return;
+          }
           const st = this._hass?.states?.[id];
           const currentAlias = st?.attributes?.Alias;
           this._promptAlias(id, currentAlias);
@@ -569,7 +612,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
   }
 }
 
-customElements.define("snmp-switch-manager-card", SnmpSwitchManagerCard);
+customElements.get("snmp-switch-manager-card") || customElements.define("snmp-switch-manager-card", SnmpSwitchManagerCard);
 window.customCards = window.customCards || [];
 window.customCards.push({
   type: "snmp-switch-manager-card",
@@ -577,3 +620,436 @@ window.customCards.push({
   description: "Auto-discovers SNMP Switch Manager ports with panel/list views, safe modal toggles, and diagnostics.",
   preview: true
 });
+
+// ------------------------------------------------------------
+// Embedded GUI editor
+//
+// Home Assistant's Lovelace UI needs a config editor element to be registered
+// *from the same Resource URL* as the card, so users only add a single
+// dashboard resource (the HACS-installed one).
+//
+// NOTE: We keep this fully self-contained and guarded so that if a user still
+// has the legacy editor resource installed, it won't break anything.
+// ------------------------------------------------------------
+
+// Only register the editor if it isn't already registered.
+if (!customElements.get("snmp-switch-manager-card-editor")) {
+  customElements.whenDefined("snmp-switch-manager-card").then(() => {
+    const CardClass = customElements.get("snmp-switch-manager-card");
+
+    // Tell Home Assistant how to get the editor + a stub config (guarded).
+    if (!CardClass.getConfigElement) {
+      CardClass.getConfigElement = () => {
+        return document.createElement("snmp-switch-manager-card-editor");
+      };
+    }
+    if (!CardClass.getStubConfig) {
+      CardClass.getStubConfig = () => ({
+        type: "custom:snmp-switch-manager-card",
+        title: "SNMP Switch",
+        view: "panel",
+        ports_per_row: 24,
+        panel_width: 740,
+        port_size: 18,
+        gap: 10,
+        show_labels: true,
+        label_size: 8,
+        info_position: "above",
+        hide_diagnostics: false,
+        hide_virtual_interfaces: false,
+      });
+    }
+
+    class SnmpSwitchManagerCardEditor extends HTMLElement {
+      constructor() {
+        super();
+        this.attachShadow({ mode: "open" });
+        this._config = {};
+        this._hass = null;
+
+        // Flags so we only render ONCE per editor instance
+        this._hasConfig = false;
+        this._hasHass = false;
+        this._rendered = false;
+      }
+
+      set hass(hass) {
+        // We keep hass so we match the editor API, even though we
+        // no longer use HA's internal picker components.
+        this._hass = hass;
+        this._hasHass = true;
+        if (this._hasConfig && !this._rendered) {
+          this._render();
+        }
+      }
+
+      setConfig(config) {
+        this._config = { ...config };
+        this._hasConfig = true;
+        if (this._hasHass && !this._rendered) {
+          this._render();
+        }
+      }
+
+      // ---- helpers ----
+      _escape(str) {
+        if (str == null) return "";
+        return String(str)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/\"/g, "&quot;");
+      }
+
+      _updateConfig(key, value) {
+        if (!this._config) this._config = {};
+        const newConfig = { ...this._config, [key]: value };
+        this._config = newConfig;
+        this.dispatchEvent(
+          new CustomEvent("config-changed", {
+            detail: { config: newConfig },
+            bubbles: true,
+            composed: true,
+          }),
+        );
+        // IMPORTANT: no re-render here – we keep the DOM as-is
+      }
+
+      _render() {
+        if (!this.shadowRoot) return;
+        const c = this._config || {};
+
+        const portsText = Array.isArray(c.ports)
+          ? c.ports.join("\n")
+          : (typeof c.ports === "string" ? c.ports : "");
+
+        const diagText = Array.isArray(c.diagnostics)
+          ? c.diagnostics.join("\n")
+          : (typeof c.diagnostics === "string" ? c.diagnostics : "");
+
+        this.shadowRoot.innerHTML = `
+          <style>
+            .form {
+              display: flex;
+              flex-direction: column;
+              gap: 12px;
+              padding: 8px 4px 12px;
+            }
+            .row {
+              display: flex;
+              flex-direction: column;
+              gap: 4px;
+            }
+            .row.inline {
+              flex-direction: row;
+              align-items: center;
+              justify-content: space-between;
+            }
+            label {
+              font-size: 13px;
+              font-weight: 500;
+            }
+            input[type="text"],
+            input[type="number"],
+            select,
+            textarea {
+              width: 100%;
+              box-sizing: border-box;
+            }
+            textarea {
+              min-height: 72px;
+              resize: vertical;
+            }
+            .two-col {
+              display: grid;
+              grid-template-columns: repeat(2, minmax(0,1fr));
+              gap: 8px;
+            }
+            .hint {
+              font-size: 12px;
+              opacity: 0.8;
+            }
+          </style>
+          <div class="form">
+            <div class="row">
+              <label for="title">Title</label>
+              <input id="title" type="text" value="${this._escape(c.title || "")}">
+            </div>
+
+            <div class="two-col">
+              <div class="row">
+                <label for="view">View</label>
+                <select id="view">
+                  <option value="panel"${c.view === "panel" ? " selected" : ""}>Panel</option>
+                  <option value="list"${c.view === "list" ? " selected" : ""}>List</option>
+                </select>
+              </div>
+              <div class="row">
+                <label for="info_position">Info position</label>
+                <select id="info_position">
+                  <option value="above"${c.info_position !== "below" ? " selected" : ""}>Above ports</option>
+                  <option value="below"${c.info_position === "below" ? " selected" : ""}>Below ports</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="row">
+              <label for="anchor_entity">Anchor entity (switch.* on target device)</label>
+              <input
+                id="anchor_entity"
+                type="text"
+                placeholder="switch.gi1_0_1"
+                value="${this._escape(c.anchor_entity || "") }"
+              >
+              <div class="hint">Used to scope auto-discovery to a specific switch device.</div>
+            </div>
+
+            <div class="two-col">
+              <div class="row">
+                <label for="device_name">Device name filter (optional)</label>
+                <input id="device_name" type="text" value="${this._escape(c.device_name || "")}">
+              </div>
+              <div class="row">
+                <label>Unit / Slot (optional)</label>
+                <div class="two-col">
+                  <input id="unit" type="number" placeholder="Unit" value="${c.unit != null ? Number(c.unit) : ""}">
+                  <input id="slot" type="number" placeholder="Slot" value="${c.slot != null ? Number(c.slot) : ""}">
+                </div>
+              </div>
+            </div>
+
+            <div class="two-col">
+              <div class="row">
+                <label for="ports_per_row">Ports per row (panel)</label>
+                <input id="ports_per_row" type="number" min="1" value="${c.ports_per_row != null ? Number(c.ports_per_row) : 24}">
+              </div>
+              <div class="row">
+                <label for="panel_width">Panel width</label>
+                <input id="panel_width" type="number" min="200" value="${c.panel_width != null ? Number(c.panel_width) : 740}">
+              </div>
+            </div>
+
+            <div class="two-col">
+              <div class="row">
+                <label for="port_size">Port size</label>
+                <input id="port_size" type="number" min="8" value="${c.port_size != null ? Number(c.port_size) : 18}">
+              </div>
+              <div class="row">
+                <label for="gap">Port gap</label>
+                <input id="gap" type="number" min="0" value="${c.gap != null ? Number(c.gap) : 10}">
+              </div>
+            </div>
+
+            <div class="row inline">
+              <label for="show_labels">Show labels under ports</label>
+              <input id="show_labels" type="checkbox"${c.show_labels !== false ? " checked" : ""}>
+            </div>
+
+            <div class="row inline">
+              <label for="hide_diagnostics">Hide Diagnostics panel</label>
+              <input id="hide_diagnostics" type="checkbox"${c.hide_diagnostics ? " checked" : ""}>
+            </div>
+
+            <div class="row inline">
+              <label for="hide_virtual_interfaces">Hide Virtual Interfaces panel</label>
+              <input id="hide_virtual_interfaces" type="checkbox"${c.hide_virtual_interfaces ? " checked" : ""}>
+            </div>
+
+            
+            <div class="row">
+              <label for="background_image">Panel background image (optional)</label>
+              <input id="background_image" type="text" placeholder="/local/your_switch.png" value="${c.background_image != null ? this._escape(c.background_image) : ""}">
+            </div>
+
+            <div class="row two">
+              <div>
+                <label for="ports_offset_x">Ports offset X (px)</label>
+                <input id="ports_offset_x" type="number" value="${c.ports_offset_x != null ? Number(c.ports_offset_x) : 0}">
+              </div>
+              <div>
+                <label for="ports_offset_y">Ports offset Y (px)</label>
+                <input id="ports_offset_y" type="number" value="${c.ports_offset_y != null ? Number(c.ports_offset_y) : 0}">
+              </div>
+            </div>
+
+            <div class="row">
+              <label for="ports_scale">Ports scale</label>
+              <input id="ports_scale" type="number" step="0.05" min="0.1" value="${c.ports_scale != null ? Number(c.ports_scale) : 1}">
+            </div>
+
+            <div class="row">
+              <label for="port_positions">Port positions (optional JSON map)</label>
+              <textarea id="port_positions" rows="6" placeholder='{"Gi1/0/1":{"x":20,"y":40}}'>${c.port_positions ? this._escape(JSON.stringify(c.port_positions)) : ""}</textarea>
+              <div class="hint">Keys are interface Names; values are SVG x/y coords. Leave blank to use the grid layout.</div>
+            </div>
+
+<div class="row">
+              <label for="label_size">Label font size</label>
+              <input id="label_size" type="number" min="6" value="${c.label_size != null ? Number(c.label_size) : 8}">
+            </div>
+
+            <div class="row">
+              <label for="ports">Explicit ports (optional)</label>
+              <textarea
+                id="ports"
+                placeholder="switch.gi1_0_1\nswitch.gi1_0_2"
+              >${this._escape(portsText)}</textarea>
+              <div class="hint">One entity ID per line. If set, only these switch entities will be shown (auto-discovery is skipped).</div>
+            </div>
+
+            <div class="row">
+              <label for="diagnostics">Diagnostics sensors (optional)</label>
+              <textarea
+                id="diagnostics"
+                placeholder="sensor.hostname\nsensor.model"
+              >${this._escape(diagText)}</textarea>
+              <div class="hint">One sensor entity ID per line, in display order.</div>
+            </div>
+          </div>
+        `;
+
+        const root = this.shadowRoot;
+
+        // Title
+        root.getElementById("title")?.addEventListener("input", (ev) => {
+          this._updateConfig("title", ev.target.value);
+        });
+
+        // View
+        root.getElementById("view")?.addEventListener("change", (ev) => {
+          this._updateConfig("view", ev.target.value || "panel");
+        });
+
+        // Info position
+        root.getElementById("info_position")?.addEventListener("change", (ev) => {
+          this._updateConfig(
+            "info_position",
+            ev.target.value === "below" ? "below" : "above",
+          );
+        });
+
+        // Anchor entity
+        root.getElementById("anchor_entity")?.addEventListener("input", (ev) => {
+          const val = ev.target.value.trim();
+          this._updateConfig("anchor_entity", val || null);
+        });
+
+        // Device name
+        root.getElementById("device_name")?.addEventListener("input", (ev) => {
+          const val = ev.target.value.trim();
+          this._updateConfig("device_name", val || null);
+        });
+
+        // Unit / Slot
+        root.getElementById("unit")?.addEventListener("change", (ev) => {
+          const v = parseInt(ev.target.value, 10);
+          this._updateConfig("unit", Number.isFinite(v) ? v : null);
+        });
+        root.getElementById("slot")?.addEventListener("change", (ev) => {
+          const v = parseInt(ev.target.value, 10);
+          this._updateConfig("slot", Number.isFinite(v) ? v : null);
+        });
+
+        // Ports per row
+        root.getElementById("ports_per_row")?.addEventListener("change", (ev) => {
+          const v = parseInt(ev.target.value, 10);
+          this._updateConfig("ports_per_row", Number.isFinite(v) ? v : 24);
+        });
+
+        // Panel width
+        root.getElementById("panel_width")?.addEventListener("change", (ev) => {
+          const v = parseInt(ev.target.value, 10);
+          this._updateConfig("panel_width", Number.isFinite(v) ? v : 740);
+        });
+
+        // Port size
+        root.getElementById("port_size")?.addEventListener("change", (ev) => {
+          const v = parseInt(ev.target.value, 10);
+          this._updateConfig("port_size", Number.isFinite(v) ? v : 18);
+        });
+
+        // Gap
+        root.getElementById("gap")?.addEventListener("change", (ev) => {
+          const v = parseInt(ev.target.value, 10);
+          this._updateConfig("gap", Number.isFinite(v) ? v : 10);
+        });
+
+        // Show labels
+        root.getElementById("show_labels")?.addEventListener("change", (ev) => {
+          this._updateConfig("show_labels", !!ev.target.checked);
+        });
+
+        // Hide panels
+        root.getElementById("hide_diagnostics")?.addEventListener("change", (ev) => {
+          this._updateConfig("hide_diagnostics", !!ev.target.checked);
+        });
+        root.getElementById("hide_virtual_interfaces")?.addEventListener("change", (ev) => {
+          this._updateConfig("hide_virtual_interfaces", !!ev.target.checked);
+        });
+
+        
+        // Background image + positioning
+        root.getElementById("background_image")?.addEventListener("change", (ev) => {
+          const v = String(ev.target.value || "").trim();
+          this._updateConfig("background_image", v ? v : null);
+        });
+        root.getElementById("ports_offset_x")?.addEventListener("change", (ev) => {
+          const v = parseFloat(ev.target.value);
+          this._updateConfig("ports_offset_x", Number.isFinite(v) ? v : 0);
+        });
+        root.getElementById("ports_offset_y")?.addEventListener("change", (ev) => {
+          const v = parseFloat(ev.target.value);
+          this._updateConfig("ports_offset_y", Number.isFinite(v) ? v : 0);
+        });
+        root.getElementById("ports_scale")?.addEventListener("change", (ev) => {
+          const v = parseFloat(ev.target.value);
+          this._updateConfig("ports_scale", (Number.isFinite(v) && v > 0) ? v : 1);
+        });
+        root.getElementById("port_positions")?.addEventListener("change", (ev) => {
+          const raw = String(ev.target.value || "").trim();
+          if (!raw) { this._updateConfig("port_positions", null); return; }
+          try {
+            const obj = JSON.parse(raw);
+            this._updateConfig("port_positions", (obj && typeof obj === "object") ? obj : null);
+          } catch (e) {
+            // Keep the user's text, but don't break the editor; ignore invalid JSON.
+          }
+        });
+
+// Label size
+        root.getElementById("label_size")?.addEventListener("change", (ev) => {
+          const v = parseInt(ev.target.value, 10);
+          this._updateConfig("label_size", Number.isFinite(v) ? v : 8);
+        });
+
+        // Explicit ports textarea
+        root.getElementById("ports")?.addEventListener("input", (ev) => {
+          const text = ev.target.value || "";
+          const list = text
+            .split(/\r?\n/)
+            .map((ln) => ln.trim())
+            .filter((ln) => ln.length > 0);
+          this._updateConfig("ports", list.length ? list : null);
+        });
+
+        // Diagnostics textarea
+        root.getElementById("diagnostics")?.addEventListener("input", (ev) => {
+          const text = ev.target.value || "";
+          const list = text
+            .split(/\r?\n/)
+            .map((ln) => ln.trim())
+            .filter((ln) => ln.length > 0);
+          this._updateConfig("diagnostics", list);
+        });
+
+        // Mark as rendered so we don't re-render on subsequent hass/setConfig calls
+        this._rendered = true;
+      }
+    }
+
+    // Final guard in case something registered it between our initial check
+    if (!customElements.get("snmp-switch-manager-card-editor")) {
+      customElements.get("snmp-switch-manager-card-editor") || customElements.define("snmp-switch-manager-card-editor", SnmpSwitchManagerCardEditor);
+    }
+  });
+}
