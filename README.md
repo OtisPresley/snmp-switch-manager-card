@@ -54,7 +54,8 @@ Once complete, everything will be fully managed by HACS and you will continue to
 
 ### Manual installation
 
-1. Download the `snmp-switch-manager-card.js` and  `snmp-switch-manager-card-editor.js` files and place them in `www/community/snmp-switch-manager-card/` in Home Assistant.
+1. Download the `snmp-switch-manager-card.js` and  `snmp-switch-manager-card-editor.js` files and place it in Home Assistant here:
+`/config/www/community/snmp-switch-manager-card/`
 
 2. Add **only one** JavaScript resource under  
 **Settings → Dashboards → Resources**:
