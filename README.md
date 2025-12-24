@@ -76,30 +76,34 @@ Once complete, everything will be fully managed by HACS and you will continue to
    </p>
 
    ```yaml
-   type: custom:snmp-switch-manager-card
-   title: Core Switch
-   view: panel
-   ports_per_row: 24
-   info_position: below
-   label_size: 6
-   anchor_entity: switch.gi1_0_1
-   port_size: 18
-   gap: 10
-   
-   # Optional display controls
-   hide_diagnostics: false
-   hide_virtual_interfaces: false
-   
-   # Optional panel background image (panel view only)
-   background_image: /local/switches/core-switch.png
-   ports_offset_x: 0
-   ports_offset_y: 0
-   ports_scale: 1
-   
-   # Optional per-port positioning overrides
-   port_positions:
-     Gi1/0/1: { x: 120, y: 80 }
-     Gi1/0/2: { x: 150, y: 80 }
+    type: custom:snmp-switch-manager-card
+    type: custom:snmp-switch-manager-card
+    title: Core Switch
+    view: panel
+    
+    # Select the SNMP Switch Manager device
+    device: SWITCH-BONUSCLOSET
+    
+    ports_per_row: 24
+    info_position: below
+    label_size: 6
+    port_size: 18
+    gap: 10
+    
+    # Optional display controls
+    hide_diagnostics: false
+    hide_virtual_interfaces: false
+    
+    # Optional panel background image (panel view only)
+    background_image: /local/switches/core-switch.png
+    ports_offset_x: 0
+    ports_offset_y: 0
+    ports_scale: 1
+    
+    # Optional per-port positioning overrides
+    port_positions:
+      Gi1/0/1: { x: 120, y: 80 }
+      Gi1/0/2: { x: 150, y: 80 }
    ```
 
    The follows are descriptions of the settings:
@@ -109,8 +113,6 @@ Once complete, everything will be fully managed by HACS and you will continue to
    - `panel width` The total width of the card in pixels when in panel view.
    - `info_position` displays the Diagnostics and Virtual Interfaces either `above` the phisical ports or `below` them.
    - `label_size` determines the font size used for the port labels when in panel view.
-   - `anchor_entity` is any entity in your switch so it knows which ports and diagnostics to display.
-   - `diagnostics` is a list of sensors you want to display in the diagnostics area.
    - `port_size` determines the size of the port images when in panel view.
    - `gap` determines how far apart the ports are when in panel view.
    - `hide_diagnostics` hides the Diagnostics panel entirely when set to `true`.
@@ -119,16 +121,20 @@ Once complete, everything will be fully managed by HACS and you will continue to
    - `ports_offset_x` and `ports_offset_y` move all ports to align with the background image.
    - `ports_scale` scales all ports uniformly.
    - `port_positions` allows individual ports to be positioned manually.
+   - `device` selects the SNMP Switch Manager device from Home Assistant’s Device Registry.
+     - Diagnostics are automatically discovered (Hostname, Manufacturer, Model, Firmware Revision, Uptime).
+     - Diagnostics order can be customized directly in the card editor.
+
       
    Clicking a port opens a unified information dialog (used in both panel and list views) showing:
 
-   - Interface name
-   - Admin and Oper status
-   - Speed
-   - VLAN ID
-   - Interface index
-   
-   From this dialog you can also edit the port description when supported.
+    - Interface name
+    - Admin and Oper status
+    - Speed
+    - VLAN ID
+    - Interface index
+    
+    The port power toggle updates live in the dialog as soon as the port state changes.
 
 
     <p float="left">
