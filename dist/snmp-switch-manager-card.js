@@ -26,6 +26,10 @@ class SnmpSwitchManagerCard extends HTMLElement {
     this._config = {
       title: config.title ?? "",
       view: (config.view === "panel" ? "panel" : "list"),
+
+      // Port color representation: "state" (default) or "speed"
+      color_mode: (config.color_mode === "speed") ? "speed" : "state",
+
       ports_per_row: Number.isFinite(config.ports_per_row) ? Number(config.ports_per_row) : 24,
       panel_width: Number.isFinite(config.panel_width) ? Number(config.panel_width) : 740,
       port_size: Number.isFinite(config.port_size) ? Number(config.port_size) : 18,
@@ -253,12 +257,74 @@ class SnmpSwitchManagerCard extends HTMLElement {
   }
 
   _colorFor(st) {
+    if ((this._config?.color_mode || "state") === "speed") {
+      // Speed buckets (Mbps): unknown/other => gray, 10 => red, 100 => orange, 1000 => green, 10000 => blue
+      const mbps = this._parseSpeedMbps(st?.attributes);
+      if (mbps === 10) return "#ef4444";
+      if (mbps === 100) return "#f59e0b";
+      if (mbps === 1000) return "#22c55e";
+      if (mbps === 10000) return "#3b82f6";
+      return "#9ca3af";
+    }
+
+    // Default: represent port state via Admin/Oper
     const a = String(st.attributes?.Admin || "").toLowerCase();
     const o = String(st.attributes?.Oper || "").toLowerCase();
     if (a === "down") return "#f59e0b";
     if (a === "up" && o === "up") return "#22c55e";
     if (a === "up" && o === "down") return "#ef4444";
     return "#9ca3af";
+  }
+
+  _parseSpeedMbps(attrs) {
+    // Accepts common attribute names and formats.
+    // Returns exact bucket values (10/100/1000/10000) or null for unknown.
+    if (!attrs) return null;
+    const raw =
+      attrs.Speed ?? attrs.speed ?? attrs.ifSpeed ?? attrs.if_speed ??
+      attrs.PortSpeed ?? attrs.port_speed ?? attrs.link_speed ?? attrs.LinkSpeed;
+
+    if (raw == null) return null;
+
+    // Numeric: could be Mbps, bps, or occasionally kbps.
+    if (typeof raw === "number" && Number.isFinite(raw)) {
+      const v = raw;
+      // Heuristic: if >= 1,000,000 treat as bps; else treat as Mbps.
+      const mbps = (v >= 1_000_000) ? Math.round(v / 1_000_000) : Math.round(v);
+      return this._speedBucket(mbps);
+    }
+
+    const s = String(raw).trim().toLowerCase();
+    if (!s) return null;
+
+    // Common text forms: "10M", "100 Mbps", "1G", "10G", "1000", "1 gbps", etc.
+    // Normalize separators.
+    const norm = s.replace(/\s+/g, "");
+
+    // Fast path for explicit G/M tokens.
+    if (/(^|\D)10g($|\D)/.test(norm) || /10gbps/.test(norm) || /10000m/.test(norm)) return 10000;
+    if (/(^|\D)1g($|\D)/.test(norm) || /1gbps/.test(norm) || /1000m/.test(norm)) return 1000;
+    if (/(^|\D)100m($|\D)/.test(norm) || /100mbps/.test(norm)) return 100;
+    if (/(^|\D)10m($|\D)/.test(norm) || /10mbps/.test(norm)) return 10;
+
+    // Pure numeric string.
+    const num = Number(norm);
+    if (Number.isFinite(num)) {
+      // Same heuristic as above.
+      const mbps = (num >= 1_000_000) ? Math.round(num / 1_000_000) : Math.round(num);
+      return this._speedBucket(mbps);
+    }
+
+    return null;
+  }
+
+  _speedBucket(mbps) {
+    // Only bucket known common ethernet speeds.
+    if (mbps === 10) return 10;
+    if (mbps === 100) return 100;
+    if (mbps === 1000) return 1000;
+    if (mbps === 10000) return 10000;
+    return null;
   }
 
   _buttonLabel(st) {
@@ -722,6 +788,7 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
         type: "custom:snmp-switch-manager-card",
         title: "SNMP Switch",
         view: "panel",
+        color_mode: "state",
         ports_per_row: 24,
         panel_width: 740,
         port_size: 18,
@@ -966,6 +1033,15 @@ _listDevicesFromHass() {
               </div>
             </div>
 
+            <div class="row">
+              <label for="color_mode">Port colors</label>
+              <select id="color_mode">
+                <option value="state"${(c.color_mode !== "speed") ? " selected" : ""}>State (Admin/Oper)</option>
+                <option value="speed"${(c.color_mode === "speed") ? " selected" : ""}>Speed</option>
+              </select>
+              <div class="hint">Choose whether port colors represent port state or link speed.</div>
+            </div>
+
 
 <div class="row">
   <label for="device">Switch device</label>
@@ -1105,6 +1181,12 @@ _listDevicesFromHass() {
             "info_position",
             ev.target.value === "below" ? "below" : "above",
           );
+        });
+
+        // Port colors (state vs speed)
+        root.getElementById("color_mode")?.addEventListener("change", (ev) => {
+          const v = String(ev.target.value || "state");
+          this._updateConfig("color_mode", v === "speed" ? "speed" : "state");
         });
 
 
