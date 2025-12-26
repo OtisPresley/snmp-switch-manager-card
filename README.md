@@ -124,6 +124,10 @@ Once complete, everything will be fully managed by HACS and you will continue to
    - `device` selects the SNMP Switch Manager device from Home Assistant’s Device Registry.
      - Diagnostics are automatically discovered (Hostname, Manufacturer, Model, Firmware Revision, Uptime).
      - Diagnostics order can be customized directly in the card editor.
+   - `color_mode` controls how port colors are interpreted:
+     - `state` (default): colors reflect Admin / Oper status
+     - `speed`: colors reflect negotiated link speed
+
 
       
    Clicking a port opens a unified information dialog (used in both panel and list views) showing:
@@ -142,6 +146,34 @@ Once complete, everything will be fully managed by HACS and you will continue to
       <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot3.png" alt="Screenshot 2" width="250"/>
       <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot4.png" alt="Screenshot 3" width="250"/>
     </p>
+
+---
+
+## 🎨 Port Color Legend
+
+  Port colors can represent either **port state** or **link speed**, depending on the selected `color_mode`.
+  
+  ### State Mode (default)
+  - 🟩 **Green** — Admin: Up · Oper: Up  
+  - 🟥 **Red** — Admin: Up · Oper: Down  
+  - 🟧 **Orange** — Admin: Down · Oper: Down  
+  - ⬜ **Gray** — Admin: Up · Oper: Not Present  
+  
+  ### Speed Mode
+  - 🟦 **Blue** — 10 Gbps  
+  - 🟩 **Green** — 1 Gbps  
+  - 🟧 **Orange** — 100 Mbps  
+  - 🟥 **Red** — 10 Mbps  
+  - ⬜ **Gray** — Unknown or non-standard speed  
+  
+  ### Example
+  ```yaml
+  type: custom:snmp-switch-manager-card
+  device: SWITCH-BONUSCLOSET
+  color_mode: speed
+  ```
+  
+  ℹ️ If color_mode is not specified, the card defaults to state-based coloring for full backward compatibility.
 
 ---
 
