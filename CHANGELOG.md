@@ -58,3 +58,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Port state changes now update the popup UI without requiring it to be closed and reopened
 
 ---
+
+## [0.3.1] - 2025-12-25
+### Added
+- 🎨 **Configurable port color mode**
+  - New `color_mode` option allows port colors to represent either:
+    - **Port State** (Admin / Oper status – default)
+    - **Port Speed**
+  - Mode can be switched directly from the card editor or YAML configuration
+
+### Port Color Meanings
+
+#### State Mode (default)
+- 🟩 **Green** — Admin: Up · Oper: Up  
+- 🟥 **Red** — Admin: Up · Oper: Down  
+- 🟧 **Orange** — Admin: Down · Oper: Down  
+- ⬜ **Gray** — Admin: Up · Oper: Not Present  
+
+#### Speed Mode
+- 🟦 **Blue** — 10 Gbps  
+- 🟩 **Green** — 1 Gbps  
+- 🟧 **Orange** — 100 Mbps  
+- 🟥 **Red** — 10 Mbps  
+- ⬜ **Gray** — Unknown / unsupported speed
+
+### Notes
+- Default behavior remains **unchanged** unless `color_mode` is explicitly set to `speed`
+- No visual layout, sizing, or interaction behavior was modified
