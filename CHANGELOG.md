@@ -145,3 +145,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 🎨 **Speed color semantics (Speed mode)**
   - **Unknown / unsupported speed** now renders as **Red**
   - **10 Mbps** now renders as **Gray**
+
+### Fixed
+- 🐞 Port speed reporting unknown when SNMP reporting in bps
