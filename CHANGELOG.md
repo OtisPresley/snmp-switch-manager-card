@@ -85,3 +85,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Notes
 - Default behavior remains **unchanged** unless `color_mode` is explicitly set to `speed`
 - No visual layout, sizing, or interaction behavior was modified
+
+## v0.3.3
+
+### Added
+- 📈 **Bandwidth history graph popup**
+  - RX and TX throughput displayed together in a single statistics graph
+  - Accessible directly from the port popup
+  - Uses Home Assistant Statistics Graph card internally
+
+- 🔄 **Manual graph refresh control**
+  - Refresh button added to prevent constant redraws
+  - Eliminates unnecessary chart re-rendering for better performance
+
+### Improved
+- 🧭 **Popup behavior and persistence**
+  - Bandwidth graph now opens in a modal popup instead of rendering at the bottom of the view
+  - Popup remains visible and does not auto-dismiss on state updates
+
+- 🎯 **Conditional UI rendering**
+  - RX/TX values and graph button only appear when valid bandwidth sensors exist
+  - Prevents empty graphs and non-functional buttons
+
+### Fixed
+- 🐞 Port positioning not working
