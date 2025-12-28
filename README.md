@@ -98,7 +98,12 @@ Once complete, everything will be fully managed by HACS and you will continue to
     # Optional display controls
     hide_diagnostics: false
     hide_virtual_interfaces: false
-    
+
+    # Optional Physical vs Virtual interface classification
+    # (If unset, the card uses its built-in defaults)
+    physical_prefixes: "Gi,Te,Tw,Fa,Ge,Eth,Po,Port,SLOT"
+    # physical_regex: "^(Gi|Te|Tw|Fa|Ge|Eth|Port|Po|SLOT)"
+
     # Optional panel background image (panel view only)
     background_image: /local/switches/core-switch.png
     ports_offset_x: 0
@@ -132,6 +137,12 @@ Once complete, everything will be fully managed by HACS and you will continue to
    - `color_mode` controls how port colors are interpreted:
      - `state` (default): colors reflect Admin / Oper status
      - `speed`: colors reflect negotiated link speed
+   - `physical_prefixes` controls which interfaces are treated as **Physical** (everything else becomes **Virtual**).
+     - Comma-separated list of interface name prefixes (case-insensitive)
+     - Example: `Gi,Te,Tw,Fa,Ge,Eth,Po,Port,SLOT`
+   - `physical_regex` (optional) overrides `physical_prefixes`.
+     - Regular expression applied to the interface name (case-insensitive)
+     - Example: `^(Gi|Te|Tw|Fa|Ge|Eth|Port|Po|SLOT)`
 
 
       
