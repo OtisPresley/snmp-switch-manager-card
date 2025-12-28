@@ -160,9 +160,45 @@ Once complete, everything will be fully managed by HACS and you will continue to
         <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot4.png" width="250">
       </td>
     </tr>
+    <tr>
+      <td align="center">
+        <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot13.png" width="250">
+      </td>
+      <td align="center">
+        <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot14.png" width="250">
+      </td>
+      <td align="center">
+        <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot15.png" width="250">
+      </td>
+    </tr>
   </table>
 
 ---
+
+## 🧲 Drag-and-Drop Port Calibration (Panel View)
+
+When using **panel view** with a custom switch background image, the card provides an optional
+**drag-and-drop calibration mode** to make aligning ports fast and intuitive.
+
+### What it does
+- Allows ports to be **visually repositioned** by dragging them directly on the card
+- Designed to precisely align ports with **real switch faceplates**
+- Eliminates trial-and-error guessing of `x/y` coordinates
+
+### How it works
+1. Enable **Calibration Mode** in the card editor
+2. Drag ports into their desired positions on the background image
+3. Copy the generated **`port_positions` JSON**
+4. Paste it into the card configuration
+5. Disable Calibration Mode when finished
+
+The generated positions use the same structure as manual configuration:
+
+```yaml
+port_positions:
+  Gi1/0/1: { x: 120, y: 80 }
+  Gi1/0/2: { x: 150, y: 80 }
+```
 
 ## 📈 Bandwidth Monitoring & History Graphs
 
