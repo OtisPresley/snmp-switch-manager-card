@@ -277,7 +277,7 @@ Interfaces without bandwidth sensors remain unchanged and do not show empty fiel
   color_mode: speed
   ```
   
-  ℹ️ If color_mode is not specified, the card defaults to state-based coloring for full backward compatibility.
+  > ℹ️ If color_mode is not specified, the card defaults to state-based coloring for full backward compatibility.
 
 ---
 
