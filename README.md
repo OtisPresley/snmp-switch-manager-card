@@ -139,9 +139,12 @@ Once complete, everything will be fully managed by HACS and you will continue to
 
   - Interface name
   - Admin and Oper status
+  - RX and TX throughput and cumulative
   - Speed
   - VLAN ID
   - Interface index
+  - Turn on/off button
+  - Graph button
   
   The port power toggle updates live in the dialog as soon as the port state changes.
 
@@ -158,6 +161,45 @@ Once complete, everything will be fully managed by HACS and you will continue to
       </td>
     </tr>
   </table>
+
+---
+
+## 📈 Bandwidth Monitoring & History Graphs
+
+When **Bandwidth Sensors** are enabled in the **SNMP Switch Manager integration**, the Switch Manager card automatically enhances the port popup with real-time throughput data and historical graphs.
+
+### What’s included
+- **RX and TX throughput values** displayed directly in the port popup
+- 📊 **History graph button** per interface
+- RX and TX plotted together in a single statistics graph
+- Uses Home Assistant’s native **Statistics Graph** card
+
+### Popup behavior
+- The bandwidth graph opens in a **modal popup**
+- Includes a **manual refresh button**
+- Prevents constant redraws and unnecessary re-renders
+- Popup remains visible until explicitly closed by the user
+
+### Conditional display
+The bandwidth section is shown **only when all conditions are met**:
+- Bandwidth Sensors are enabled for the device
+- The interface has valid RX and TX sensor entities
+- Sensor values are numeric and available
+
+Interfaces without bandwidth sensors remain unchanged and do not show empty fields or inactive controls.
+
+> ℹ️ No additional card configuration is required.  
+> The card automatically detects and uses the bandwidth sensors created by the integration.
+
+---
+
+## 🧠 Performance Notes
+
+- The history graph does **not auto-refresh** continuously
+- A manual refresh button is provided to:
+  - Improve dashboard performance
+  - Avoid flickering or unpredictable redraw behavior
+- This mirrors the behavior of a standalone Statistics Graph card while keeping the UI lightweight
 
 ---
 
