@@ -20,7 +20,18 @@ class SnmpSwitchManagerCard extends HTMLElement {
     // Persist modal AND its stylesheet across renders
     this._modalEl = null;
     this._modalStyle = null;
-  }
+  
+    // Bandwidth graph modal state (kept outside normal render cycle to avoid chart redraw/jitter)
+    this._graphModalEl = null;
+    this._bandwidthGraphModalRoot = null;
+    this._bandwidthGraphModalStyle = null;
+    this._graphCardEl = null;
+    this._freezeRenderWhileGraphOpen = false;
+    this._freezeRenderWhileDragging = false;
+
+    // Calibration persistence (localStorage)
+    this._calibPersistT = null;
+}
 
   setConfig(config) {
     this._config = {
@@ -71,6 +82,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
       ports_offset_y: Number.isFinite(config.ports_offset_y) ? Number(config.ports_offset_y) : 0,
       ports_scale: Number.isFinite(config.ports_scale) ? Number(config.ports_scale) : 1,
       port_positions: (config.port_positions && typeof config.port_positions === "object") ? config.port_positions : null,
+      calibration_mode: config.calibration_mode === true,
 
 // Optional panel visibility
       hide_diagnostics: config.hide_diagnostics === true,
@@ -81,12 +93,33 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+
     // If a port dialog is open, keep its toggle label in sync with live state
     if (this._modalEl && this._modalEntityId) {
       const st = hass?.states?.[this._modalEntityId];
       const btn = this._modalEl.querySelector('.ssm-modal-actions .btn.wide');
       if (btn && st) btn.textContent = this._buttonLabel(st);
     }
+
+    // When the bandwidth graph is open, avoid wiping/rebuilding the DOM on every hass update.
+    // That re-parenting causes the statistics-graph to constantly redraw.
+    if (this._graphModalEl && this._freezeRenderWhileGraphOpen) {
+      return;
+    }
+
+    // While in Calibration mode, Lovelace frequently triggers hass updates which cause the card
+    // to rebuild its entire DOM. That rebuild cancels pointer capture (drag 'drops') and resets
+    // the calibration JSON textarea scroll. Mirror the existing graph/modal strategy: freeze
+    // renders during calibration and let the user finish positioning first.
+    if (this._config?.calibration_mode && this._freezeRenderWhileCalibrationActive) {
+      return;
+    }
+
+    // While drag-calibrating, don't re-render on hass churn (it cancels pointer capture and 'drops' the drag)
+    if (this._freezeRenderWhileDragging) {
+      return;
+    }
+
     this._render();
   }
 
@@ -331,6 +364,160 @@ class SnmpSwitchManagerCard extends HTMLElement {
     return (st.state || "").toLowerCase() === "on" ? "Turn off" : "Turn on";
   }
 
+
+  _formatBitsPerSecond(v) {
+    const n = Number(v);
+    if (!isFinite(n)) return "-";
+    const abs = Math.abs(n);
+    const units = ["bit/s","Kbit/s","Mbit/s","Gbit/s","Tbit/s"];
+    let u = 0;
+    let val = abs;
+    while (val >= 1000 && u < units.length - 1) { val /= 1000; u++; }
+    const out = (val >= 100 ? val.toFixed(0) : val >= 10 ? val.toFixed(1) : val.toFixed(2));
+    return `${n < 0 ? "-" : ""}${out} ${units[u]}`;
+  }
+
+  _formatBytes(v) {
+    const n = Number(v);
+    if (!isFinite(n)) return "-";
+    const abs = Math.abs(n);
+    const units = ["B","KB","MB","GB","TB","PB"];
+    let u = 0;
+    let val = abs;
+    while (val >= 1024 && u < units.length - 1) { val /= 1024; u++; }
+    const out = (val >= 100 ? val.toFixed(0) : val >= 10 ? val.toFixed(1) : val.toFixed(2));
+    return `${n < 0 ? "-" : ""}${out} ${units[u]}`;
+  }
+
+  _findBandwidthForIfIndex(ifIndex) {
+    const hass = this._hass;
+    const idx = Number(ifIndex);
+    if (!hass || !isFinite(idx)) return null;
+
+    let rxBpsE=null, txBpsE=null, rxTotE=null, txTotE=null;
+    for (const [eid, st] of Object.entries(hass.states || {})) {
+      if (!eid.startsWith("sensor.")) continue;
+      const a = st.attributes || {};
+      if (Number(a.if_index) !== idx) continue;
+      if (a.kind === "throughput") {
+        if (a.direction === "rx") rxBpsE = eid;
+        if (a.direction === "tx") txBpsE = eid;
+      } else if (a.kind === "total") {
+        if (a.direction === "rx") rxTotE = eid;
+        if (a.direction === "tx") txTotE = eid;
+      }
+    }
+    const rxBps = rxBpsE ? Number(hass.states[rxBpsE]?.state) : null;
+    const txBps = txBpsE ? Number(hass.states[txBpsE]?.state) : null;
+    const rxTot = rxTotE ? Number(hass.states[rxTotE]?.state) : null;
+    const txTot = txTotE ? Number(hass.states[txTotE]?.state) : null;
+
+    return { rxBpsE, txBpsE, rxTotE, txTotE, rxBps, txBps, rxTot, txTot };
+  }
+
+  async _openBandwidthGraphDialog(title, rxEntityId, txEntityId, force = false) {
+    if (!this._hass || !rxEntityId || !txEntityId) return;
+
+    // Bandwidth entities update frequently. If we allow the main card to
+    // re-render while this modal is open, the statistics-graph element gets
+    // torn down/re-attached repeatedly which looks like the lines are
+    // constantly redrawing. Freeze the main render loop until the user closes
+    // the graph (or explicitly presses Refresh).
+    this._freezeRenderWhileGraphOpen = true;
+
+    // Remove any prior graph modal
+    this._graphModalEl?.remove();
+    this._graphModalStyle?.remove();
+
+    const root = document.createElement("div");
+    // Use a dedicated class so we can safely raise z-index above the port modal.
+    root.className = "ssm-modal-root ssm-graph-modal-root";
+
+    // Persist reference so we can re-attach after card re-renders.
+    // This card uses `shadowRoot.innerHTML = ...` on updates, which would
+    // otherwise wipe the dialog after a second or two when HA pushes state.
+    this._bandwidthGraphModalRoot = root;
+
+    root.innerHTML = `
+      <div class="ssm-backdrop"></div>
+      <div class="ssm-modal" role="dialog" aria-modal="true">
+        <div class="ssm-modal-title">${title} – Bandwidth</div>
+        <div class="ssm-modal-body"><div class="ssm-graph-host">Loading…</div></div>
+        <div class="ssm-modal-actions">
+          <button class="btn" data-refresh-graph="1">Refresh</button>
+          <button class="btn subtle" data-close-graph="1">Close</button>
+        </div>
+      </div>
+    `;
+
+    const style = document.createElement("style");
+    // Keep this scoped to the graph modal only.
+    style.textContent = `
+      .ssm-graph-modal-root{z-index:12000;}
+      .ssm-graph-modal-root .ssm-modal{z-index:12001;}
+      .ssm-graph-host{min-height:260px;}
+      .ssm-graph-host > *{width:100%;}
+    `;
+
+    document.body.appendChild(style);
+    this.shadowRoot.appendChild(root);
+
+    this._graphModalEl = root;
+    this._graphModalStyle = style;
+
+    const close = () => {
+      root.remove();
+      style.remove();
+      this._graphModalEl = null;
+      this._graphModalStyle = null;
+      this._bandwidthGraphModalRoot = null;
+      this._graphCardEl = null;
+      this._freezeRenderWhileGraphOpen = false;
+      // Resume normal rendering now that the graph is closed
+      this._render();
+    };
+    root.querySelector(".ssm-backdrop")?.addEventListener("click", close);
+    root.querySelector('[data-close-graph="1"]')?.addEventListener("click", close);
+    root
+      .querySelector('[data-refresh-graph="1"]')
+      ?.addEventListener("click", () =>
+        this._openBandwidthGraphDialog(title, rxEntityId, txEntityId, true)
+      );
+    const host = root.querySelector(".ssm-graph-host");
+    // Reuse existing graph card unless explicitly refreshed
+    if (!force && this._graphCardEl) {
+      host.textContent = "";
+      host.appendChild(this._graphCardEl);
+      return;
+    }
+    try {
+      const helpers = await window.loadCardHelpers?.();
+      if (!helpers) throw new Error("card helpers unavailable");
+      // Use the same (built-in) Statistics Graph card config you showed.
+      const card = helpers.createCardElement({
+        type: "statistics-graph",
+        chart_type: "line",
+        period: "5minute",
+        entities: [
+          { entity: rxEntityId },
+          { entity: txEntityId },
+        ],
+        stat_types: ["mean", "max", "min"],
+        title: `${title} Throughput`,
+        hide_legend: false,
+        logarithmic_scale: false,
+      });
+      card.hass = this._hass;
+      host.textContent = "";
+      host.appendChild(card);
+      this._graphCardEl = card;
+    } catch (e) {
+      host.textContent = "Unable to load graph.";
+      // eslint-disable-next-line no-console
+      console.warn("SNMP Switch Manager Card: graph failed", e);
+    }
+  }
+
   _toggle(entity_id) {
     const st = this._hass?.states?.[entity_id]; if (!st) return;
     const on = (st.state || "").toLowerCase() === "on";
@@ -376,6 +563,39 @@ class SnmpSwitchManagerCard extends HTMLElement {
     const vlan = attrs["VLAN ID"] ?? attrs.vlan_id ?? attrs.VLAN_ID ?? attrs.VLAN ?? attrs.vlan;
     const aliasValue = attrs.Alias ?? "";
 
+    // Bandwidth sensors are named to match the base switch entity_id, e.g.:
+    //   switch.switch_study_gi1_0_1
+    //   sensor.switch_study_gi1_0_1_rx_throughput
+    // Only show RX/TX/Graph if the sensors exist *and* have numeric state.
+    const baseObj = (entity_id || "").split(".")[1] || "";
+    const rxRateE = baseObj ? `sensor.${baseObj}_rx_throughput` : null;
+    const txRateE = baseObj ? `sensor.${baseObj}_tx_throughput` : null;
+    const rxTotE = baseObj ? `sensor.${baseObj}_rx_total` : null;
+    const txTotE = baseObj ? `sensor.${baseObj}_tx_total` : null;
+
+    const _numState = (eid) => {
+      if (!eid) return null;
+      const st2 = this._hass?.states?.[eid];
+      if (!st2) return null;
+      const s = (st2.state ?? "").toString();
+      const sl = s.toLowerCase();
+      if (sl === "unknown" || sl === "unavailable" || sl === "") return null;
+      const n = Number(s);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const rxBps = _numState(rxRateE);
+    const txBps = _numState(txRateE);
+    const rxTot = _numState(rxTotE);
+    const txTot = _numState(txTotE);
+    const hasRates = (rxBps != null) && (txBps != null);
+
+    const rxRate = (rxBps != null) ? this._formatBitsPerSecond(rxBps) : "-";
+    const txRate = (txBps != null) ? this._formatBitsPerSecond(txBps) : "-";
+    const rxTotS = (rxTot != null) ? this._formatBytes(rxTot) : "-";
+    const txTotS = (txTot != null) ? this._formatBytes(txTot) : "-";
+    const canGraph = hasRates;
+
     // remove any prior modal/style
     this._modalEl?.remove(); this._modalStyle?.remove();
     this._modalEntityId = entity_id;
@@ -390,6 +610,8 @@ class SnmpSwitchManagerCard extends HTMLElement {
           <div><b>Admin:</b> ${attrs.Admin ?? "-"}</div>
           <div><b>Oper:</b> ${attrs.Oper ?? "-"}</div>
           <div><b>Speed:</b> ${speed ?? "-"}</div>
+          ${hasRates ? `<div><b>RX:</b> ${rxRate} <span class="hint">(${rxTotS})</span></div>` : ``}
+          ${hasRates ? `<div><b>TX:</b> ${txRate} <span class="hint">(${txTotS})</span></div>` : ``}
           <div><b>VLAN ID:</b> ${vlan ?? "-"}</div>
           ${ip}
           <div><b>Index:</b> ${attrs.Index ?? "-"}</div>
@@ -401,6 +623,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
         </div>
         <div class="ssm-modal-actions">
           <button class="btn wide" data-entity="${entity_id}">${this._buttonLabel(st)}</button>
+          ${canGraph ? `<button class="btn subtle" data-bw-graph="1">Graph</button>` : ``}
           <button class="btn subtle" data-close="1">Close</button>
         </div>
       </div>
@@ -452,6 +675,15 @@ class SnmpSwitchManagerCard extends HTMLElement {
     });
 
     // Edit alias via prompt (shared helper)
+    const graphBtn = this._modalEl.querySelector("[data-bw-graph]");
+    if (graphBtn && canGraph) {
+      graphBtn.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this._openBandwidthGraphDialog(name, rxRateE, txRateE);
+      });
+    }
+
     const editBtn = this._modalEl.querySelector("[data-alias-edit]");
     if (editBtn) {
       editBtn.addEventListener("pointerdown", (ev) => {
@@ -478,6 +710,312 @@ class SnmpSwitchManagerCard extends HTMLElement {
     // Append both style and modal
     this.shadowRoot.append(this._modalStyle, this._modalEl);
   }
+
+  _reattachTransientModals() {
+    // This card re-renders on every hass update and rewrites shadowRoot.innerHTML.
+    // That wipes any imperatively-added dialogs unless we re-attach them.
+    if (this._bandwidthGraphModalRoot && !this._bandwidthGraphModalRoot.isConnected) {
+      this.shadowRoot.appendChild(this._bandwidthGraphModalRoot);
+    }
+  }
+
+
+  // ---------- calibration helper (panel view) ----------
+  _copyToClipboard(text) {
+    try {
+      if (navigator?.clipboard?.writeText) return navigator.clipboard.writeText(text);
+    } catch (e) {}
+    // fallback
+    try { window.prompt("Copy to clipboard:", text); } catch (e) {}
+    return Promise.resolve();
+  }
+
+  _svgPoint(svg, clientX, clientY) {
+    if (!svg || typeof svg.createSVGPoint !== "function") return null;
+    const pt = svg.createSVGPoint();
+    pt.x = clientX; pt.y = clientY;
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return null;
+    return pt.matrixTransform(ctm.inverse());
+  }
+
+
+  _calibStorageKey() {
+    // Persist calibration between re-renders / card re-instantiation (e.g. in the UI editor preview)
+    // Key is scoped per device prefix + card title + background image (so different models/images don't collide).
+    const prefix = this._inferDevicePrefix() || "unknown";
+    const title = String(this._config?.title || "");
+    const bg = String(this._config?.background_image || "");
+    return `ssm_calib_v1:${prefix}:${title}:${bg}`;
+  }
+
+  _loadCalibMapFromStorage() {
+    try {
+      const key = this._calibStorageKey();
+      const raw = localStorage.getItem(key);
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      return (obj && typeof obj === "object") ? obj : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  _persistCalibMapToStorage() {
+    try {
+      const key = this._calibStorageKey();
+      const obj = (this._calibMap && typeof this._calibMap === "object") ? this._calibMap : {};
+      localStorage.setItem(key, JSON.stringify(obj));
+    } catch (e) {}
+  }
+
+  _persistCalibMapDebounced() {
+    clearTimeout(this._calibPersistT);
+    this._calibPersistT = setTimeout(() => this._persistCalibMapToStorage(), 150);
+  }
+
+  _setupCalibrationUI() {
+    const enabled = !!this._config?.calibration_mode;
+    // Clear any prior calibration state when disabled
+    if (!enabled) {
+      this._calibSelected = null;
+      this._calibMap = null;
+      this._freezeRenderWhileCalibrationActive = false;
+      return;
+    }
+
+    const root = this.shadowRoot;
+    const svg = root?.querySelector("svg[data-ssm-panel]");
+    if (!svg) return;
+
+    // Freeze re-renders from hass churn while calibration mode is active.
+    // Similar to the graph/modal fix: rebuilding the shadow DOM resets the textarea scroll
+    // and can cancel pointer capture mid-drag.
+    this._freezeRenderWhileCalibrationActive = true;
+
+    // Init map from config once, then keep it across renders while calibration mode is enabled.
+    // Otherwise any hass state refresh (or periodic re-render) will "snap" ports back to their
+    // original grid positions.
+    if (!this._calibMap) {
+      // Prefer persisted (localStorage) calibration map first so positions don't snap back
+      // if Lovelace re-instantiates the card (common in the UI editor preview).
+      const stored = this._loadCalibMapFromStorage();
+      if (stored) {
+        this._calibMap = stored;
+      } else {
+        const raw = (this._config.port_positions && typeof this._config.port_positions === "object") ? this._config.port_positions : {};
+        this._calibMap = JSON.parse(JSON.stringify(raw || {}));
+      }
+    }
+    this._calibSelected = this._calibSelected || null;
+
+    const elSelected = root.getElementById("ssm-calib-selected");
+    const elXY = root.getElementById("ssm-calib-xy");
+    const elJson = root.getElementById("ssm-calib-json");
+    const crossV = root.getElementById("ssm-calib-cross-v");
+    const crossH = root.getElementById("ssm-calib-cross-h");
+
+    const applyPortXY = (g, x, y) => {
+      const rect = g?.querySelector?.("rect");
+      if (rect) {
+        rect.setAttribute("x", String(x));
+        rect.setAttribute("y", String(y));
+      }
+      const label = g?.querySelector?.("text.label");
+      if (label) {
+        const Ps = (Number.isFinite(this._config?.port_size) ? this._config.port_size : 18) * (Number.isFinite(this._config?.ports_scale) ? this._config.ports_scale : 1);
+        label.setAttribute("x", String(x + Ps / 2));
+        label.setAttribute("y", String(y + Ps + (Number.isFinite(this._config?.label_size) ? this._config.label_size : 8)));
+      }
+    };
+
+    const refreshJson = () => {
+      if (elJson) {
+        // Updating textarea.value resets scroll; preserve user scroll position unless they're already at bottom.
+        const prevTop = elJson.scrollTop;
+        const prevHeight = elJson.scrollHeight;
+        const atBottom = (prevTop + elJson.clientHeight) >= (prevHeight - 8);
+
+        elJson.value = Object.keys(this._calibMap || {}).length
+          ? JSON.stringify(this._calibMap, null, 2)
+          : "";
+
+        // Restore scroll
+        if (atBottom) {
+          elJson.scrollTop = elJson.scrollHeight;
+        } else {
+          elJson.scrollTop = prevTop;
+        }
+      }
+      if (elSelected) elSelected.textContent = this._calibSelected || "(click a port)";
+    };
+    refreshJson();
+
+    // Clicking a port selects it (no modal) + supports drag & drop positioning
+    root.querySelectorAll(".port-svg[data-entity]").forEach(g => {
+      if (g._ssmCalibBound) return;
+      g._ssmCalibBound = true;
+
+      let dragging = false;
+      let dragPointerId = null;
+      let dragDx = 0;
+      let dragDy = 0;
+
+      let winMove = null;
+      let winEnd = null;
+
+      const onDragMove = (ev) => {
+        if (!dragging || dragPointerId !== ev.pointerId) return;
+        ev.preventDefault();
+        const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
+        updateCrosshair(pt);
+        if (!pt || !this._calibSelected) return;
+
+        const nx = Math.round(pt.x - dragDx);
+        const ny = Math.round(pt.y - dragDy);
+
+        this._calibMap = this._calibMap || {};
+        this._calibMap[this._calibSelected] = { x: nx, y: ny };
+        applyPortXY(g, nx, ny);
+        // Don't rewrite the JSON textarea on every mouse move. Updating textarea.value resets
+        // its scroll position and makes it impossible to read while dragging.
+        this._persistCalibMapDebounced();
+      };
+
+      const endDrag = (ev) => {
+        if (dragPointerId !== ev.pointerId) return;
+        dragging = false;
+        dragPointerId = null;
+        this._freezeRenderWhileDragging = false;
+
+        // Restore text selection/cursor
+        try {
+          if (this._calibPrevUserSelect !== undefined) document.body.style.userSelect = this._calibPrevUserSelect;
+          if (this._calibPrevCursor !== undefined) document.body.style.cursor = this._calibPrevCursor;
+        } catch (e) {}
+
+        refreshJson();
+
+        if (winMove) { window.removeEventListener("pointermove", winMove, true); winMove = null; }
+        if (winEnd) {
+          window.removeEventListener("pointerup", winEnd, true);
+          window.removeEventListener("pointercancel", winEnd, true);
+          winEnd = null;
+        }
+
+        try { svg.releasePointerCapture(ev.pointerId); } catch (e) {}
+        try { g.releasePointerCapture(ev.pointerId); } catch (e) {}
+      };
+
+      const getPortKey = () => {
+        const title = g.querySelector("title")?.textContent || "";
+        const name = g.getAttribute("data-portname") || title.split(" • ").slice(-1)[0] || "";
+        return String(name || "").trim();
+      };
+
+      const getCurrentXY = () => {
+        const rect = g.querySelector("rect");
+        const x = rect ? Number(rect.getAttribute("x")) : NaN;
+        const y = rect ? Number(rect.getAttribute("y")) : NaN;
+        return {
+          x: Number.isFinite(x) ? x : 0,
+          y: Number.isFinite(y) ? y : 0,
+        };
+      };
+
+      const selectPort = () => {
+        this._calibSelected = getPortKey();
+        root.querySelectorAll(".port-svg").forEach(x => x.classList.remove("calib-selected"));
+        g.classList.add("calib-selected");
+        refreshJson();
+      };
+
+      g.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        selectPort();
+
+        // Mirror the prior modal/graph interaction fix: prevent text selection and keep a stable
+        // pointer interaction while dragging.
+        try {
+          this._calibPrevUserSelect = document.body.style.userSelect;
+          this._calibPrevCursor = document.body.style.cursor;
+          document.body.style.userSelect = "none";
+          document.body.style.cursor = "grabbing";
+        } catch (e) {}
+
+        // Prevent Lovelace/state churn from re-rendering during an active drag (causes the drag to 'drop')
+        this._freezeRenderWhileDragging = true;
+
+        // Start dragging immediately; this feels natural for DnD positioning
+        const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
+        if (!pt) { this._freezeRenderWhileDragging = false; return; }
+        const cur = getCurrentXY();
+        dragging = true;
+        dragPointerId = ev.pointerId;
+        dragDx = pt.x - cur.x;
+        dragDy = pt.y - cur.y;
+        try { g.setPointerCapture(ev.pointerId); } catch (e) {}
+        try { svg.setPointerCapture(ev.pointerId); } catch (e) {}
+
+        // Attach window-level handlers to keep dragging smooth even if pointer leaves the element
+        winMove = onDragMove.bind(this);
+        winEnd = endDrag.bind(this);
+        window.addEventListener("pointermove", winMove, true);
+        window.addEventListener("pointerup", winEnd, true);
+        window.addEventListener("pointercancel", winEnd, true);
+      }, { passive: false });
+    });
+
+    const updateCrosshair = (pt) => {
+      if (!pt) return;
+      if (crossV) { crossV.setAttribute("x1", pt.x); crossV.setAttribute("x2", pt.x); }
+      if (crossH) { crossH.setAttribute("y1", pt.y); crossH.setAttribute("y2", pt.y); }
+      if (elXY) elXY.textContent = `${Math.round(pt.x)}, ${Math.round(pt.y)}`;
+    };
+
+    // Pointer move / click on background to set selected port's position
+    const hit = root.getElementById("ssm-calib-hit");
+    if (hit && !hit._ssmBound) {
+      hit._ssmBound = true;
+      hit.addEventListener("pointermove", (ev) => {
+        const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
+        updateCrosshair(pt);
+      }, { passive: true });
+
+      hit.addEventListener("pointerdown", (ev) => {
+        const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
+        updateCrosshair(pt);
+        if (!pt || !this._calibSelected) return;
+
+        // Set top-left coords for the selected port
+        this._calibMap = this._calibMap || {};
+        this._calibMap[this._calibSelected] = { x: Math.round(pt.x), y: Math.round(pt.y) };
+        refreshJson();
+        this._persistCalibMapDebounced();
+      }, { passive: true });
+    }
+
+    // Buttons
+    root.getElementById("ssm-calib-copy-json")?.addEventListener("click", () => {
+      const txt = elJson?.value || "";
+      if (txt) this._copyToClipboard(txt);
+    });
+    root.getElementById("ssm-calib-copy-entry")?.addEventListener("click", () => {
+      if (!this._calibSelected) return;
+      const entry = this._calibMap?.[this._calibSelected];
+      if (!entry) return;
+      this._copyToClipboard(JSON.stringify({ [this._calibSelected]: entry }, null, 2));
+    });
+    root.getElementById("ssm-calib-clear")?.addEventListener("click", () => {
+      this._calibMap = {};
+      this._calibSelected = null;
+      root.querySelectorAll(".port-svg").forEach(x => x.classList.remove("calib-selected"));
+      refreshJson();
+      this._persistCalibMapDebounced();
+    });
+  }
+
 
   async _render() {
     if (!this.shadowRoot || !this._config || !this._hass) return;
@@ -518,11 +1056,24 @@ class SnmpSwitchManagerCard extends HTMLElement {
       /* Panel */
       .panel { padding: 8px 12px 6px; }
       svg { display:block; }
+      svg[data-ssm-panel] { touch-action: none; }
+      .port-svg { touch-action: none; }
       .label { font-size: ${this._config.label_size}px; fill: var(--primary-text-color); opacity:.85; }
       .panel-wrap { border-radius:12px; border:1px solid var(--divider-color);
         /* Prefer HA theme vars; fall back to card background for themes that don't set --ha-card-background */
         padding:6; background: color-mix(in oklab, var(--ha-card-background, var(--card-background-color, #1f2937)) 75%, transparent); }
       .panel-wrap.bg { background-repeat:no-repeat; background-position:center; background-size:contain; }
+
+      .port-svg.calib-selected rect { stroke: rgba(255,255,255,.9); stroke-width: 2; }
+      .calib-tools{ margin:12px 16px 16px 16px; padding:12px; border:1px dashed var(--divider-color); border-radius:12px; background:rgba(0,0,0,.12); }
+      .calib-row{ display:flex; justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap; }
+      .calib-title{ font-weight:700; }
+      .calib-status{ font-size:12px; color:var(--secondary-text-color); }
+      .calib-hint{ margin-top:6px; font-size:12px; color:var(--secondary-text-color); }
+      #ssm-calib-json{ width:100%; margin-top:10px; font-family:var(--code-font-family, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);
+        font-size:12px; padding:10px; border-radius:10px; border:1px solid var(--divider-color); background:var(--card-background-color); color:var(--primary-text-color); box-sizing:border-box;
+        height: 220px; overflow:auto; overscroll-behavior: contain; }
+      .calib-actions{ display:flex; gap:8px; justify-content:flex-end; margin-top:10px; flex-wrap:wrap; }
 
     `;
 
@@ -542,6 +1093,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
       // Re-attach modal/style if open
       if (this._modalStyle) this.shadowRoot.append(this._modalStyle);
       if (this._modalEl) this.shadowRoot.append(this._modalEl);
+      this._reattachTransientModals();
       return;
     }
 
@@ -641,12 +1193,42 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
 const usableW = W - 2 * sidePad, slotW = usableW / perRow;
 
+      // Optional per-port positioning overrides (panel view)
+      // Map keys are interface Names (e.g. "Gi1/0/1"). Matching is case-insensitive.
+      // When calibration mode is enabled we may have a live (in-memory) map that differs from
+      // config.port_positions. Use the live map so drag/drop doesn't snap back on refresh.
+      const portPosRaw = (this._config.calibration_mode && this._calibMap && typeof this._calibMap === "object")
+        ? this._calibMap
+        : ((this._config.port_positions && typeof this._config.port_positions === "object")
+            ? this._config.port_positions
+            : null);
+      const portPos = portPosRaw
+        ? new Map(Object.entries(portPosRaw).map(([k, v]) => [String(k).trim().toLowerCase(), v]))
+        : null;
+
       const rects = panelPorts.map(([id, st], i) => {
         const a = st.attributes || {};
         const name = String(a.Name || id.split(".")[1] || "");
         const alias = a.Alias;
         const idx = i % perRow, row = Math.floor(i / perRow);
-        const x = sidePad + idx * slotW + (slotW - P) / 2, y = topPad + row * (P + G) + 18;
+        let x = sidePad + idx * slotW + (slotW - P) / 2;
+        let y = topPad + row * (P + G) + 18;
+
+        // Apply explicit position override if provided (values are SVG coords for the port's top-left).
+        if (portPos) {
+          const key = String(name).trim().toLowerCase();
+          const ov = portPos.get(key) || portPos.get(String((id || "").split(".")[1] || "").trim().toLowerCase());
+          if (ov && typeof ov === "object") {
+            const ox = Number(ov.x);
+            const oy = Number(ov.y);
+            if (Number.isFinite(ox)) x = ox;
+            if (Number.isFinite(oy)) y = oy;
+          }
+        }
+
+        // Global offsets (px) are applied after any per-port overrides.
+        x += offX;
+        y += offY;
         const fill = this._colorFor(st);
         const Ps = P * scale;
         const label = this._config.show_labels
@@ -657,7 +1239,7 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
         titleParts.push(name);
         const title = this._htmlEscape(titleParts.join(" • "));
         return `
-          <g class="port-svg" data-entity="${id}" tabindex="0" style="cursor:pointer">
+          <g class="port-svg" data-entity="${id}" data-portname="${this._htmlEscape(name)}" tabindex="0" style="cursor:pointer">
             <title>${title}</title>
             <rect x="${x}" y="${y}" width="${Ps}" height="${Ps}" rx="${Math.round(Ps * 0.2)}"
               fill="${fill}" stroke="rgba(0,0,0,.35)"/>
@@ -667,15 +1249,45 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
 
       const svg = `
         <div class="panel-wrap${useBg ? " bg" : ""}"${useBg ? ` style="background-image:url(${bgUrl})"` : ""}>
-          <svg viewBox="0 0 ${W} ${H}" width="100%" height="auto" preserveAspectRatio="xMidYMid meet">
+          <svg data-ssm-panel="1" viewBox="0 0 ${W} ${H}" width="100%" height="auto" preserveAspectRatio="xMidYMid meet">
+
+            ${this._config.calibration_mode ? `
+              <!-- Background hit-target must be BEHIND ports so port dragging/selection works -->
+              <rect id="ssm-calib-hit" x="0" y="0" width="${W}" height="${H}" fill="rgba(0,0,0,0.001)" style="pointer-events:all"></rect>
+            ` : ``}
+
             ${plate}
             ${rects}
+            ${this._config.calibration_mode ? `
+              <g id="ssm-calib-layer" style="pointer-events:none">
+                <line id="ssm-calib-cross-v" x1="0" y1="0" x2="0" y2="${H}" stroke="rgba(255,255,255,.35)" stroke-width="1"></line>
+                <line id="ssm-calib-cross-h" x1="0" y1="0" x2="${W}" y2="0" stroke="rgba(255,255,255,.35)" stroke-width="1"></line>
+              </g>
+            ` : ``}
           </svg>
         </div>`;
 
       return `
         ${this._config.info_position === "above" ? infoGrid : ""}
         <div class="panel">${svg}</div>
+        ${this._config.calibration_mode ? `
+          <div class="calib-tools">
+            <div class="calib-row">
+              <div class="calib-title">Calibration mode</div>
+              <div class="calib-status">Selected: <span id="ssm-calib-selected">(click a port)</span> • Cursor: <span id="ssm-calib-xy">-</span></div>
+            </div>
+            <div class="calib-hint">
+              1) Drag and drop ports to the desired positions  2) Copy JSON and paste into <b>Port positions</b> box in <b>Settings</b>
+            </div>
+            <textarea id="ssm-calib-json" rows="8" readonly></textarea>
+            <div class="calib-actions">
+              <button class="btn" id="ssm-calib-copy-entry" type="button">Copy selected entry</button>
+              <button class="btn" id="ssm-calib-copy-json" type="button">Copy full JSON</button>
+              <button class="btn subtle" id="ssm-calib-clear" type="button">Clear</button>
+            </div>
+          </div>
+        ` : ``}
+
         ${this._config.info_position === "below" ? infoGrid : ""}`;
     };
 
@@ -735,20 +1347,29 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
         ev.preventDefault();
         ev.stopPropagation();
         const id = g.getAttribute("data-entity");
-        if (id) this._openDialog(id);
+        if (!id) return;
+        if (this._config?.calibration_mode) return; // handled by calibration helper
+        this._openDialog(id);
       });
       g.addEventListener("keypress", (ev) => {
         if (ev.key === "Enter" || ev.key === " ") {
           ev.preventDefault();
           const id = g.getAttribute("data-entity");
-          if (id) this._openDialog(id);
+          if (!id) return;
+          if (this._config?.calibration_mode) return; // handled by calibration helper
+          this._openDialog(id);
         }
       });
     });
 
+    // Calibration overlay/tools (panel view)
+    this._setupCalibrationUI();
+
     // Re-attach modal AND style if they exist (so it stays styled and centered)
     if (this._modalStyle) this.shadowRoot.append(this._modalStyle);
     if (this._modalEl) this.shadowRoot.append(this._modalEl);
+
+    this._reattachTransientModals();
   }
 }
 
@@ -798,6 +1419,7 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
         info_position: "above",
         hide_diagnostics: false,
         hide_virtual_interfaces: false,
+        calibration_mode: false,
         device: null,
       });
     }
@@ -1118,6 +1740,11 @@ _listDevicesFromHass() {
               <div class="hint">Keys are interface Names; values are SVG x/y coords. Leave blank to use the grid layout.</div>
             </div>
 
+            <div class="row inline">
+              <label for="calibration_mode">Calibration mode (click-to-generate Port positions JSON)</label>
+              <input id="calibration_mode" type="checkbox"${c.calibration_mode ? " checked" : ""}>
+            </div>
+
 <div class="row">
               <label for="label_size">Label font size</label>
               <input id="label_size" type="number" min="6" value="${c.label_size != null ? Number(c.label_size) : 8}">
@@ -1259,6 +1886,11 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
           } catch (e) {
             // Keep the user's text, but don't break the editor; ignore invalid JSON.
           }
+        });
+
+
+        root.getElementById("calibration_mode")?.addEventListener("change", (ev) => {
+          this._updateConfig("calibration_mode", !!ev.target.checked);
         });
 
 // Label size
