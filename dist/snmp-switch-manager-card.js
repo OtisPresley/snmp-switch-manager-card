@@ -82,6 +82,9 @@ class SnmpSwitchManagerCard extends HTMLElement {
       ports_offset_y: Number.isFinite(config.ports_offset_y) ? Number(config.ports_offset_y) : 0,
       ports_scale: Number.isFinite(config.ports_scale) ? Number(config.ports_scale) : 1,
       port_positions: (config.port_positions && typeof config.port_positions === "object") ? config.port_positions : null,
+      physical_prefixes: (typeof config.physical_prefixes === "string") ? config.physical_prefixes : null,
+      physical_regex: (typeof config.physical_regex === "string") ? config.physical_regex : null,
+
       calibration_mode: config.calibration_mode === true,
 
 // Optional panel visibility
@@ -263,7 +266,40 @@ class SnmpSwitchManagerCard extends HTMLElement {
     for (const [id, st] of entries) {
       const nRaw = String(st.attributes?.Name || id.split(".")[1] || "");
       const n = nRaw.toUpperCase();
-      const isPhysical = /^(GI|TE|TW)/.test(n) || n.startsWith("SLOT") || /^switch\.(gi|te|tw)\d+_\d+_\d+$/i.test(id);
+      const rxStr = (this._config?.physical_regex || "").trim();
+      const prefStr = (this._config?.physical_prefixes || "").trim();
+
+      let isPhysical = false;
+
+      // 1) Advanced override: regex (case-insensitive)
+      if (rxStr) {
+        try {
+          const rx = new RegExp(rxStr, "i");
+          isPhysical = rx.test(n) || rx.test(id);
+        } catch (e) {
+          // Invalid regex: fall back to prefixes/defaults
+          isPhysical = false;
+        }
+      }
+
+      // 2) Easy mode: comma-separated prefixes (used only if regex not set/invalid)
+      if (!isPhysical && !rxStr) {
+        const prefs = prefStr
+          ? prefStr.split(",").map(s => s.trim()).filter(Boolean)
+          : [];
+        if (prefs.length) {
+          const nUp = n.toUpperCase();
+          isPhysical = prefs.some(p => nUp.startsWith(String(p).trim().toUpperCase()));
+        }
+      }
+
+      // 3) Default behavior (backwards compatible)
+      if (!isPhysical && !rxStr && !prefStr) {
+        isPhysical =
+          /^(GI|TE|TW)/.test(n) ||
+          n.startsWith("SLOT") ||
+          /^switch\.(gi|te|tw)\d+_\d+_\d+$/i.test(id);
+      }
       if (isPhysical) phys.push([id, st]);
       else virt.push([id, st]);
     }
@@ -1687,6 +1723,19 @@ _listDevicesFromHass() {
   <div class="hint">Select a SNMP Switch Manager device (derived from entity ID prefixes).</div>
 </div>
 
+<div class="two-col">
+  <div class="row">
+    <label for="physical_prefixes">Physical interface prefixes (comma-separated)</label>
+    <input id="physical_prefixes" type="text" placeholder="Gi,Te,Tw,Fa,Ge,Eth,Po,Port,SLOT" value="${c.physical_prefixes != null ? this._escape(String(c.physical_prefixes)) : ""}">
+    <div class="hint">Interfaces whose <b>Name</b> starts with any prefix are treated as <b>Physical</b>. All others are treated as <b>Virtual</b>.</div>
+  </div>
+  <div class="row">
+    <label for="physical_regex">Physical interface regex (optional override)</label>
+    <input id="physical_regex" type="text" placeholder="^(Gi|Te|Tw|Fa|Ge|Eth|Po|Port|SLOT)" value="${c.physical_regex != null ? this._escape(String(c.physical_regex)) : ""}">
+    <div class="hint">If set, this regex (case-insensitive) determines which interfaces are <b>Physical</b>. Prefix list is ignored when regex is provided.</div>
+  </div>
+</div>
+
             </div>
             <div class="two-col">
               <div class="row">
@@ -1835,6 +1884,19 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
   const val = String(ev.target.value || "").trim();
   this._updateConfig("device", val || null);
 });
+
+        // Physical interface classification (panel/list)
+        // Use "change" (commit-on-blur/enter) instead of "input" to avoid the HA
+        // visual editor re-rendering on every keystroke (which causes focus loss).
+        root.getElementById("physical_prefixes")?.addEventListener("change", (ev) => {
+          const val = String(ev.target.value || "");
+          this._updateConfig("physical_prefixes", val.trim() ? val : null);
+        });
+        root.getElementById("physical_regex")?.addEventListener("change", (ev) => {
+          const val = String(ev.target.value || "");
+          this._updateConfig("physical_regex", val.trim() ? val : null);
+        });
+
         // Ports per row
         root.getElementById("ports_per_row")?.addEventListener("change", (ev) => {
           const v = parseInt(ev.target.value, 10);
