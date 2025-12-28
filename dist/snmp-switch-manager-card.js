@@ -293,12 +293,19 @@ class SnmpSwitchManagerCard extends HTMLElement {
     if ((this._config?.color_mode || "state") === "speed") {
       // Speed buckets (Mbps): unknown/other => gray, 10 => red, 100 => orange, 1000 => green, 10000 => blue
       const mbps = this._parseSpeedMbps(st?.attributes);
-      if (mbps === 10) return "#ef4444";
-      if (mbps === 100) return "#f59e0b";
-      if (mbps === 1000) return "#22c55e";
-      if (mbps === 10000) return "#3b82f6";
+      if (mbps === 10) return "#ef4444";      // 10M
+      if (mbps === 100) return "#f59e0b";     // 100M
+      if (mbps === 1000) return "#22c55e";    // 1G
+      if (mbps === 2500) return "#14b8a6";    // 2.5G (teal)
+      if (mbps === 5000) return "#0ea5e9";    // 5G (cyan)
+      if (mbps === 10000) return "#3b82f6";   // 10G
+      if (mbps === 20000) return "#6366f1";   // 20G
+      if (mbps === 25000) return "#8b5cf6";   // 25G
+      if (mbps === 40000) return "#a855f7";   // 40G
+      if (mbps === 50000) return "#d946ef";   // 50G
+      if (mbps === 100000) return "#ec4899";  // 100G
       return "#9ca3af";
-    }
+          }
 
     // Default: represent port state via Admin/Oper
     const a = String(st.attributes?.Admin || "").toLowerCase();
@@ -352,11 +359,17 @@ class SnmpSwitchManagerCard extends HTMLElement {
   }
 
   _speedBucket(mbps) {
-    // Only bucket known common ethernet speeds.
     if (mbps === 10) return 10;
     if (mbps === 100) return 100;
     if (mbps === 1000) return 1000;
+    if (mbps === 2500) return 2500;
+    if (mbps === 5000) return 5000;
     if (mbps === 10000) return 10000;
+    if (mbps === 20000) return 20000;
+    if (mbps === 25000) return 25000;
+    if (mbps === 40000) return 40000;
+    if (mbps === 50000) return 50000;
+    if (mbps === 100000) return 100000;
     return null;
   }
 
