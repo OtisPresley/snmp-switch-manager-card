@@ -87,7 +87,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - No visual layout, sizing, or interaction behavior was modified
 
 ## [0.3.3] - 2025-12-26
-
 ### Added
 - 📈 **Bandwidth history graph popup**
   - RX and TX throughput displayed together in a single statistics graph
