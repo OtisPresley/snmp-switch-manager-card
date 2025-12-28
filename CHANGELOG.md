@@ -86,6 +86,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Default behavior remains **unchanged** unless `color_mode` is explicitly set to `speed`
 - No visual layout, sizing, or interaction behavior was modified
 
+---
+
 ## [0.3.3] - 2025-12-26
 ### Added
 - 📈 **Bandwidth history graph popup**
@@ -127,3 +129,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - 🐞 Port positioning settings not applying in panel view
+
+---
+
+## [0.3.4] - 2025-12-28
+### Added
+- 🧩 **Configurable Physical vs Virtual interface classification (card)**
+  - New editor fields allow users to define how Physical interfaces are detected:
+    - `physical_prefixes` (comma-separated prefix list)
+    - `physical_regex` (optional regex override; takes precedence)
+  - Interfaces that do not match are treated as **Virtual**
+  - Backward compatible: if unset, existing default behavior remains
+
+### Changed
+- 🎨 **Speed color semantics (Speed mode)**
+  - **Unknown / unsupported speed** now renders as **Red**
+  - **10 Mbps** now renders as **Gray**
