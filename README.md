@@ -143,8 +143,6 @@ Once complete, everything will be fully managed by HACS and you will continue to
    - `physical_regex` (optional) overrides `physical_prefixes`.
      - Regular expression applied to the interface name (case-insensitive)
      - Example: `^(Gi|Te|Tw|Fa|Ge|Eth|Port|Po|SLOT)`
-
-
       
    Clicking a port opens a unified information dialog (used in both panel and list views) showing:
 
@@ -183,6 +181,96 @@ Once complete, everything will be fully managed by HACS and you will continue to
       </td>
     </tr>
   </table>
+
+**Example using vertical stack card.** Thanks to [@larieu](https://github.com/larieu) for contributing this.
+ <table>
+    <tr>
+      <td align="center">
+        <img src="https://raw.githubusercontent.com/otispresley/snmp-switch-manager/main/assets/screenshot16.png" width="250">
+      </td>
+    </tr>
+  </table>
+
+**24 port switch:**
+```yaml
+  type: vertical-stack
+  cards:
+    - type: custom:snmp-switch-manager-card
+      title: ""
+      view: panel
+      color_mode: state
+      ports_per_row: 24
+      panel_width: 1480
+      port_size: 36
+      gap: 10
+      show_labels: false
+      label_size: 8
+      info_position: below
+      hide_diagnostics: true
+      hide_virtual_interfaces: true
+      calibration_mode: false
+      device: gs1900_24ep
+      ports_scale: 1.5
+    - type: custom:snmp-switch-manager-card
+      title: ""
+      view: panel
+      color_mode: speed
+      ports_per_row: 24
+      panel_width: 1480
+      port_size: 36
+      gap: 10
+      show_labels: true
+      label_size: 24
+      info_position: below
+      hide_diagnostics: false
+      hide_virtual_interfaces: true
+      calibration_mode: false
+      device: gs1900_24ep
+      ports_scale: 1.5
+  title: SNMP Switch 24
+  grid_options:
+    columns: 24
+    rows: auto
+```
+
+**8 port switch:**
+```yaml
+  type: vertical-stack
+  cards:
+    - type: custom:snmp-switch-manager-card
+      title: ""
+      view: panel
+      color_mode: state
+      ports_per_row: 8
+      panel_width: 740
+      port_size: 36
+      gap: 10
+      show_labels: false
+      label_size: 8
+      info_position: below
+      hide_diagnostics: true
+      hide_virtual_interfaces: true
+      calibration_mode: false
+      device: gs1900_8hp_01
+      ports_scale: 1.5
+    - type: custom:snmp-switch-manager-card
+      title: ""
+      view: panel
+      color_mode: speed
+      ports_per_row: 8
+      panel_width: 740
+      port_size: 36
+      gap: 10
+      show_labels: true
+      label_size: 24
+      info_position: below
+      hide_diagnostics: false
+      hide_virtual_interfaces: true
+      calibration_mode: false
+      device: gs1900_8hp_01
+      ports_scale: 1.5
+title: SNMP Switch 08 - 01
+```
 
 ---
 
