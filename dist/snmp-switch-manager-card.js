@@ -1,3 +1,98 @@
+// Internal: normalize config without changing behavior.
+// This provides a single canonical place to evolve config handling over time.
+
+// Internal: natural-ish compare for interface names like Gi1/0/2 vs Gi1/0/10.
+// Splits into alpha and numeric tokens and compares token-by-token.
+function _ssmNaturalPortCompare(a, b) {
+  const sa = String(a ?? "");
+  const sb = String(b ?? "");
+  if (sa === sb) return 0;
+
+  const ta = sa.match(/(\d+|[^\d]+)/g) || [sa];
+  const tb = sb.match(/(\d+|[^\d]+)/g) || [sb];
+  const n = Math.max(ta.length, tb.length);
+
+  for (let i = 0; i < n; i++) {
+    const xa = ta[i];
+    const xb = tb[i];
+    if (xa == null) return -1;
+    if (xb == null) return 1;
+
+    const na = /^\d+$/.test(xa);
+    const nb = /^\d+$/.test(xb);
+
+    if (na && nb) {
+      const ia = parseInt(xa, 10);
+      const ib = parseInt(xb, 10);
+      if (ia !== ib) return ia - ib;
+      // same numeric value but different width (e.g., 01 vs 1)
+      if (xa.length !== xb.length) return xa.length - xb.length;
+    } else if (!na && !nb) {
+      const ca = xa.localeCompare(xb, undefined, { sensitivity: "base" });
+      if (ca !== 0) return ca;
+    } else {
+      // put alpha tokens before numeric tokens for stability
+      return na ? 1 : -1;
+    }
+  }
+
+  return sa.localeCompare(sb, undefined, { sensitivity: "base" });
+}
+
+function _ssmNormalizeConfig(config) {
+  // IMPORTANT: do not introduce new defaults here unless they already exist implicitly
+  // in the card/editor behavior. Keep this behavior-preserving.
+  if (!config || typeof config !== "object") return {};
+  // Shallow clone to avoid accidental external mutation.
+  const out = { ...config };
+
+  // Drop deprecated / renamed keys to keep saved YAML clean.
+  // Keep this list explicit (do not strip unknown future keys).
+  const deprecatedKeys = [
+    "show_uplinks_separately_in_layout", // old/typo key
+  ];
+  for (const k of deprecatedKeys) {
+    if (k in out) delete out[k];
+  }
+
+  return out;
+}
+
+
+
+function _ssmNormListToSet(v) {
+  // Accept array of strings, comma-separated string, or null/undefined.
+  const out = new Set();
+  if (Array.isArray(v)) {
+    for (const it of v) {
+      const k = String(it ?? "").trim().toLowerCase();
+      if (k) out.add(k);
+    }
+    return out;
+  }
+  if (typeof v === "string") {
+    for (const part of v.split(",")) {
+      const k = String(part ?? "").trim().toLowerCase();
+      if (k) out.add(k);
+    }
+  }
+  return out;
+}
+
+
+function _ssmIsHiddenPort(config, portName, entityId) {
+  try {
+    const set = _ssmNormListToSet(config?.hide_ports);
+    if (!set || set.size === 0) return false;
+    const n = String(portName ?? "").trim().toLowerCase();
+    const e = String(entityId ?? "").trim().toLowerCase();
+    return (n && set.has(n)) || (e && set.has(e));
+  } catch (e) {
+    return false;
+  }
+}
+
+
 class SnmpSwitchManagerCard extends HTMLElement {
   constructor() {
     super();
@@ -31,21 +126,42 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
     // Calibration persistence (localStorage)
     this._calibPersistT = null;
+
+
+    // Editor draft values to prevent re-render from clobbering input while typing
+    this._draftValues = {};
+    this._editingFields = new Set();
 }
 
   setConfig(config) {
+    config = _ssmNormalizeConfig(config);
+
+    const prevCalib = !!this._config?.calibration_mode;
+
     this._config = {
       title: config.title ?? "",
       view: (config.view === "panel" ? "panel" : "list"),
 
       // Port color representation: "state" (default) or "speed"
       color_mode: (config.color_mode === "speed") ? "speed" : "state",
+      // Optional per-speed color overrides (keyed by normalized speed labels like "1 Gbps")
+      speed_colors: (config.speed_colors && typeof config.speed_colors === "object" && !Array.isArray(config.speed_colors))
+        ? { ...config.speed_colors }
+        : null,
+      // Optional per-state color overrides (Admin/Oper status)
+      state_colors: (config.state_colors && typeof config.state_colors === "object" && !Array.isArray(config.state_colors))
+        ? { ...config.state_colors }
+        : null,
+
+
 
       ports_per_row: Number.isFinite(config.ports_per_row) ? Number(config.ports_per_row) : 24,
       panel_width: Number.isFinite(config.panel_width) ? Number(config.panel_width) : 740,
-      port_size: Number.isFinite(config.port_size) ? Number(config.port_size) : 18,
+      // Port size is now controlled via Port scale + Layout Editor; keep internal base size.
+      port_size: 18,
       gap: Number.isFinite(config.gap) ? Number(config.gap) : 10,
       show_labels: config.show_labels !== false,
+      label_numbers_only: config.label_numbers_only === true,
       label_size: Number.isFinite(config.label_size) ? Number(config.label_size) : 8,
 
       // choose where Diagnostics/Virtual block appears
@@ -76,12 +192,23 @@ class SnmpSwitchManagerCard extends HTMLElement {
             })()
           : ["hostname","manufacturer","model","firmware_revision","uptime"],
 
+      // Optional per-diagnostic enable/disable map.
+      // Keys can be built-in diagnostic keys (hostname/model/...) or custom entity_ids.
+      diagnostics_enabled: (config.diagnostics_enabled && typeof config.diagnostics_enabled === "object" && !Array.isArray(config.diagnostics_enabled))
+        ? { ...config.diagnostics_enabled }
+        : {},
+
       // Optional custom background image + port positioning (panel view only)
       background_image: (typeof config.background_image === "string" && config.background_image.trim()) ? config.background_image.trim() : null,
-      ports_offset_x: Number.isFinite(config.ports_offset_x) ? Number(config.ports_offset_x) : 0,
-      ports_offset_y: Number.isFinite(config.ports_offset_y) ? Number(config.ports_offset_y) : 0,
-      ports_scale: Number.isFinite(config.ports_scale) ? Number(config.ports_scale) : 1,
+      // Ports offset is deprecated (Layout Editor replaces it).
+      ports_offset_x: 0,
+      ports_offset_y: 0,
+      // Accept both legacy key (ports_scale) and the editor key (port_scale)
+      ports_scale: Number.isFinite(config.port_scale)
+        ? Number(config.port_scale)
+        : (Number.isFinite(config.ports_scale) ? Number(config.ports_scale) : 1),
       port_positions: (config.port_positions && typeof config.port_positions === "object") ? config.port_positions : null,
+      virtual_overrides: Array.isArray(config.virtual_overrides) ? config.virtual_overrides : ((typeof config.virtual_overrides === "string") ? config.virtual_overrides.split(",").map(s=>s.trim()).filter(Boolean) : null),
       physical_prefixes: (typeof config.physical_prefixes === "string") ? config.physical_prefixes : null,
       physical_regex: (typeof config.physical_regex === "string") ? config.physical_regex : null,
 
@@ -90,9 +217,30 @@ class SnmpSwitchManagerCard extends HTMLElement {
 // Optional panel visibility
       hide_diagnostics: config.hide_diagnostics === true,
       hide_virtual_interfaces: config.hide_virtual_interfaces === true,
+      // Port visibility
+      hide_ports: Array.isArray(config.hide_ports) ? config.hide_ports : (typeof config.hide_ports === "string" ? config.hide_ports.split(",").map(s=>s.trim()).filter(Boolean) : []),
+
+      // Label styling
+      label_color: config.label_color ?? config.label_font_color ?? "",
+      label_bg_color: config.label_bg_color ?? config.label_background_color ?? "",
+
+      // Label options
+      label_numbers_only: config.label_numbers_only === true,
+
+      // Uplinks (Smart Assist)
+      show_uplinks_separately: config.show_uplinks_separately === true,
+      uplink_ports: Array.isArray(config.uplink_ports) ? config.uplink_ports : (typeof config.uplink_ports === "string" ? config.uplink_ports.split(",").map(s=>s.trim()).filter(Boolean) : []),
+      // When Port colors = Speed: clicking a port can open the traffic graph instead of the port info modal
+      speed_click_opens_graph: config.speed_click_opens_graph === true,
+
     };
-    this._render();
-  }
+
+    // If the user closed the Layout Editor overlay, keep it hidden until they toggle Layout Editor off/on.
+    if (!this._config.calibration_mode) this._calibUiClosed = false;
+    else if (!prevCalib && this._config.calibration_mode) this._calibUiClosed = false;
+
+    this._safeRender();
+}
 
   set hass(hass) {
     this._hass = hass;
@@ -110,7 +258,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
       return;
     }
 
-    // While in Calibration mode, Lovelace frequently triggers hass updates which cause the card
+    // While in Layout Editor, Lovelace frequently triggers hass updates which cause the card
     // to rebuild its entire DOM. That rebuild cancels pointer capture (drag 'drops') and resets
     // the calibration JSON textarea scroll. Mirror the existing graph/modal strategy: freeze
     // renders during calibration and let the user finish positioning first.
@@ -123,10 +271,28 @@ class SnmpSwitchManagerCard extends HTMLElement {
       return;
     }
 
-    this._render();
-  }
+    this._safeRender();
+}
 
   getCardSize() { return 5; }
+
+
+  _safeRender() {
+    try {
+      this._render();
+    } catch (err) {
+      // Never let a render exception blank the whole card; show a visible error.
+      // eslint-disable-next-line no-console
+      console.error("SNMP Switch Manager Card render error:", err);
+      const msg = (err && (err.stack || err.message)) ? String(err.stack || err.message) : String(err);
+      this.shadowRoot.innerHTML = `
+        <ha-card style="padding:12px;">
+          <div style="font-weight:600; margin-bottom:8px;">SNMP Switch Manager Card error</div>
+          <pre style="white-space:pre-wrap; font-size:12px; opacity:0.85;">${msg.replace(/</g,"&lt;")}</pre>
+        </ha-card>`;
+    }
+  }
+
 
   // ---------- registries ----------
   async _ensureRegistries() {
@@ -176,19 +342,47 @@ class SnmpSwitchManagerCard extends HTMLElement {
     return ent ? ent.split("_")[0] : "";
   }
 
+
   _getDiagnosticsEntityIds() {
     const H = this._hass?.states || {};
     const prefix = this._inferDevicePrefix();
     if (!prefix) return [];
-    const def = ["hostname","manufacturer","model","firmware_revision","uptime"];
+
+    // Built-in diagnostic keys mapped to entity suffixes
+    const builtin = ["hostname", "manufacturer", "model", "firmware_revision", "uptime"];
+    const aliasToBuiltin = {
+      firmware: "firmware_revision",
+      firmware_revision: "firmware_revision",
+    };
+
     const order = (Array.isArray(this._config?.diagnostics_order) && this._config.diagnostics_order.length)
       ? this._config.diagnostics_order
-      : def;
+      : builtin;
+
+    const enabledMap = (this._config?.diagnostics_enabled && typeof this._config.diagnostics_enabled === "object")
+      ? this._config.diagnostics_enabled
+      : {};
+
     const out = [];
-    for (const key of order) {
-      const k = String(key || "");
-      if (!def.includes(k)) continue;
-      const eid = `sensor.${prefix}_${k}`;
+    for (const raw of order) {
+      const key = String(raw || "").trim();
+      if (!key) continue;
+
+      // Skip disabled
+      if (enabledMap[key] === false) continue;
+
+      // Custom entity_id (e.g. sensor.some_sensor)
+      if (key.includes(".")) {
+        if (H[key]) out.push(key);
+        continue;
+      }
+
+      // Built-in key (with aliases)
+      const mapped = aliasToBuiltin[key] || key;
+      if (!builtin.includes(mapped)) continue;
+
+      const eid = `sensor.${prefix}_${mapped}`;
+      if (enabledMap[mapped] === false) continue; // support disabling via mapped key too
       if (H[eid]) out.push(eid);
     }
     return out;
@@ -221,14 +415,34 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
   async _discoverEntities() {
     const H = this._hass?.states || {};
-    const explicit = Array.isArray(this._config.ports) && this._config.ports.length;
+    const explicit = false; // explicit ports feature removed; use Hide ports instead
 
     if (this._config.anchor_entity && !this._anchorDeviceId) {
       await this._resolveAnchorDeviceId();
       this._render(); // allow re-render
     }
 
-    const entries = explicit
+    // Performance: avoid scanning the *entire* hass.states registry on every render.
+    // When a device prefix is selected, cache the matching entity_ids and reuse them
+    // as long as the state registry key-count is unchanged.
+    let entries;
+    if (!explicit && this._config.device) {
+      const pref = `switch.${String(this._config.device)}_`;
+      const keyCount = Object.keys(H).length;
+      if (this._cachedDevicePrefix !== pref || this._cachedStatesKeyCount !== keyCount) {
+        const ids = [];
+        for (const id in H) {
+          if (id.startsWith(pref)) ids.push(id);
+        }
+        this._cachedDevicePrefix = pref;
+        this._cachedStatesKeyCount = keyCount;
+        this._cachedDeviceEntityIds = ids;
+      }
+      const ids = Array.isArray(this._cachedDeviceEntityIds) ? this._cachedDeviceEntityIds : [];
+      entries = ids.map(id => [id, H[id]]).filter(([, st]) => !!st);
+    }
+
+    entries = entries || (explicit
       ? this._config.ports.map(id => [id, H[id]]).filter(([, st]) => !!st)
       : Object.entries(H).filter(([id, st]) => {
           if (!id.startsWith("switch.")) return false;
@@ -242,6 +456,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
           if (!looksRight) return false;
 
           // Preferred scoping: device hostname prefix (switch.<device>_*)
+          // (Handled by the cached fast-path above when device is set.)
           if (this._config.device) {
             const pref = `switch.${String(this._config.device)}_`;
             if (!id.startsWith(pref)) return false;
@@ -255,7 +470,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
             if (!this._entityMatchesNameUnitSlot(id, st)) return false;
           }
           return true;
-        });
+        }));
 
     if (!entries.length && !explicit) {
       const candidates = Object.keys(H).filter(k => k.startsWith("switch.")).slice(0, 20);
@@ -263,9 +478,25 @@ class SnmpSwitchManagerCard extends HTMLElement {
     }
 
     const phys = [], virt = [];
+    const _hideSet = _ssmNormListToSet(this._config?.hide_ports);
+    const _virtSet = _ssmNormListToSet(this._config?.virtual_overrides);
     for (const [id, st] of entries) {
       const nRaw = String(st.attributes?.Name || id.split(".")[1] || "");
+      const idKey = String(id).trim().toLowerCase();
       const n = nRaw.toUpperCase();
+      if (_hideSet.size) {
+        const nKey = String(nRaw).trim().toLowerCase();
+        const idKey = String(id).trim().toLowerCase();
+        if (_hideSet.has(nKey) || _hideSet.has(idKey)) continue;
+      }
+      // Virtual overrides (independent of visibility toggle)
+      if (_virtSet && _virtSet.size) {
+        const nKey2 = String(n).trim().toLowerCase();
+        if (_virtSet.has(nKey2) || _virtSet.has(idKey)) {
+          virt.push([id, st]);
+          continue;
+        }
+      }
       const rxStr = (this._config?.physical_regex || "").trim();
       const prefStr = (this._config?.physical_prefixes || "").trim();
 
@@ -324,33 +555,132 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
     return { phys, virt, diag: null };
   }
+  _defaultSpeedPalette() {
+    // Default palette (consistent with README legend)
+    return {
+      "10 Mbps": "#9ca3af",      // gray
+      "100 Mbps": "#f59e0b",     // orange
+      "1 Gbps": "#22c55e",       // green
+      "2.5 Gbps": "#14b8a6",     // teal
+      "5 Gbps": "#0ea5e9",       // cyan
+      "10 Gbps": "#3b82f6",      // blue
+      "20 Gbps": "#6366f1",      // indigo
+      "25 Gbps": "#8b5cf6",      // violet
+      "40 Gbps": "#a855f7",      // purple
+      "50 Gbps": "#d946ef",      // fuchsia
+      "100 Gbps": "#ec4899",     // pink
+      "Unknown": "#ef4444",      // red
+    };
+  }
+
+  _speedLabelFromMbps(mbps) {
+    if (!mbps || !Number.isFinite(mbps)) return null;
+    if (mbps === 10) return "10 Mbps";
+    if (mbps === 100) return "100 Mbps";
+    if (mbps === 1000) return "1 Gbps";
+    if (mbps === 2500) return "2.5 Gbps";
+    if (mbps === 5000) return "5 Gbps";
+    if (mbps === 10000) return "10 Gbps";
+    if (mbps === 20000) return "20 Gbps";
+    if (mbps === 25000) return "25 Gbps";
+    if (mbps === 40000) return "40 Gbps";
+    if (mbps === 50000) return "50 Gbps";
+    if (mbps === 100000) return "100 Gbps";
+    return null;
+  }
+
+  _speedLabelFromAttrs(attrs) {
+    if (!attrs) return null;
+
+    // Prefer an already-normalized human string if the integration provides it.
+    const candidates = [
+      attrs.SpeedLabel, attrs.speed_label, attrs.speedLabel, attrs.speedText, attrs.speed_text,
+      attrs.LinkSpeedLabel, attrs.link_speed_label, attrs.LinkSpeedText, attrs.link_speed_text,
+      attrs.PortSpeedLabel, attrs.port_speed_label,
+      attrs.Speed, attrs.speed, attrs.PortSpeed, attrs.port_speed, attrs.link_speed, attrs.LinkSpeed,
+      attrs.ifSpeed, attrs.if_speed
+    ].filter(v => v != null);
+
+    for (const raw of candidates) {
+      if (typeof raw !== "string") continue;
+      const s0 = raw.trim();
+      if (!s0) continue;
+
+      // Normalize formats like "2.5Gbps", "100Mbps", "1 Gbps", "10 mbps"
+      const s = s0.replace(/\s+/g, " ").trim();
+      const compact = s.toLowerCase().replace(/\s+/g, "");
+      const m = compact.match(/^([0-9]+(?:\.[0-9]+)?)(m|g)bps$/);
+      if (m) {
+        const num = m[1];
+        const unit = (m[2] === "g") ? "Gbps" : "Mbps";
+        return `${num} ${unit}`;
+      }
+
+      // Already looks like "10 Mbps" / "1 Gbps"
+      if (/^[0-9]+(?:\.[0-9]+)?\s*(m|g)bps$/i.test(s)) {
+        const mm = s.match(/^([0-9]+(?:\.[0-9]+)?)\s*(m|g)bps$/i);
+        const num = mm[1];
+        const unit = (mm[2].toLowerCase() === "g") ? "Gbps" : "Mbps";
+        return `${num} ${unit}`;
+      }
+    }
+
+    // Fall back to numeric parsing/heuristics.
+    const mbps = this._parseSpeedMbps(attrs);
+    return this._speedLabelFromMbps(mbps);
+  }
+
+
 
   _colorFor(st) {
     if ((this._config?.color_mode || "state") === "speed") {
-      // Speed buckets (Mbps): unknown/other => gray, 10 => red, 100 => orange, 1000 => green, 10000 => blue
-      const mbps = this._parseSpeedMbps(st?.attributes);
-      if (mbps === 10) return "#ef4444";      // 10M
-      if (mbps === 100) return "#f59e0b";     // 100M
-      if (mbps === 1000) return "#22c55e";    // 1G
-      if (mbps === 2500) return "#14b8a6";    // 2.5G (teal)
-      if (mbps === 5000) return "#0ea5e9";    // 5G (cyan)
-      if (mbps === 10000) return "#3b82f6";   // 10G
-      if (mbps === 20000) return "#6366f1";   // 20G
-      if (mbps === 25000) return "#8b5cf6";   // 25G
-      if (mbps === 40000) return "#a855f7";   // 40G
-      if (mbps === 50000) return "#d946ef";   // 50G
-      if (mbps === 100000) return "#ec4899";  // 100G
-      return "#9ca3af";
-          }
+      const palette = this._defaultSpeedPalette();
+      const attrs = st?.attributes || null;
+
+      // Prefer the integration's normalized human label when available.
+      const label = this._speedLabelFromAttrs(attrs) || "Unknown";
+
+      // Per-speed override (stored in config) wins over defaults.
+      const overrides = this._config?.speed_colors || null;
+      const overrideColor = overrides && typeof overrides === "object" ? overrides[label] : null;
+      if (typeof overrideColor === "string" && overrideColor.trim()) return overrideColor.trim();
+
+      // Default palette.
+      return palette[label] || palette["Unknown"];
+    }
 
     // Default: represent port state via Admin/Oper
+    const palette = this._defaultStatePalette();
+    const overrides = this._config?.state_colors && typeof this._config.state_colors === "object"
+      ? this._config.state_colors
+      : null;
+
     const a = String(st.attributes?.Admin || "").toLowerCase();
     const o = String(st.attributes?.Oper || "").toLowerCase();
-    if (a === "down") return "#f59e0b";
-    if (a === "up" && o === "up") return "#22c55e";
-    if (a === "up" && o === "down") return "#ef4444";
-    return "#9ca3af";
+
+    const key =
+      (a === "up" && o === "up") ? "up_up" :
+      (a === "up" && o === "down") ? "up_down" :
+      (a === "down" && o === "down") ? "down_down" :
+      (a === "up" && (o === "not present" || o === "not_present" || o === "notpresent")) ? "up_not_present" :
+      null;
+
+    const defColor = key ? (palette[key] || palette["up_not_present"]) : palette["up_not_present"];
+    const overrideColor = key && overrides ? overrides[key] : null;
+    if (typeof overrideColor === "string" && overrideColor.trim()) return overrideColor.trim();
+    return defColor;
   }
+
+  _defaultStatePalette() {
+    // Defaults match the card's current state mode legend.
+    return {
+      "up_up": "#22c55e",           // Green — Admin: Up • Oper: Up
+      "up_down": "#ef4444",         // Red — Admin: Up • Oper: Down
+      "down_down": "#f59e0b",       // Orange — Admin: Down • Oper: Down
+      "up_not_present": "#9ca3af",  // Gray — Admin: Up • Oper: Not Present
+    };
+  }
+
 
   _parseSpeedMbps(attrs) {
     // Accepts common attribute names and formats.
@@ -503,12 +833,22 @@ class SnmpSwitchManagerCard extends HTMLElement {
     // Keep this scoped to the graph modal only.
     style.textContent = `
       .ssm-graph-modal-root{z-index:12000;}
-      .ssm-graph-modal-root .ssm-modal{z-index:12001;}
+      .ssm-graph-modal-root .ssm-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:12000;}
+      .ssm-graph-modal-root .ssm-modal{position:fixed;z-index:12001;left:50%;top:50%;transform:translate(-50%,-50%);
+        min-width:320px;max-width:90vw;background:var(--card-background-color);
+        color:var(--primary-text-color);border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,0.5);padding:16px;}
+      .ssm-graph-modal-root .ssm-modal-title{font-weight:700;font-size:18px;margin-bottom:8px}
+      .ssm-graph-modal-root .ssm-modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+      .ssm-graph-modal-root .btn{font:inherit;padding:8px 12px;border-radius:10px;border:1px solid var(--divider-color);
+        background:var(--secondary-background-color);cursor:pointer}
+      .ssm-graph-modal-root .btn.subtle{background:transparent}
       .ssm-graph-host{min-height:260px;}
       .ssm-graph-host > *{width:100%;}
     `;
 
-    document.body.appendChild(style);
+    // NOTE: This modal lives inside the card's shadowRoot, so its styles must also live there.
+    // Appending the <style> to document.body will NOT apply to shadow DOM.
+    root.prepend(style);
     this.shadowRoot.appendChild(root);
 
     this._graphModalEl = root;
@@ -603,6 +943,31 @@ class SnmpSwitchManagerCard extends HTMLElement {
     return next;
   }
 
+
+  _maybeOpenBandwidthGraphForPort(entity_id) {
+    // Only used for the "Speed colors" click behavior toggle.
+    const hass = this._hass;
+    if (!hass || !entity_id) return false;
+
+    const baseObj = String(entity_id).split(".")[1] || "";
+    if (!baseObj) return false;
+
+    const rxEntityId = `sensor.${baseObj}_rx_throughput`;
+    const txEntityId = `sensor.${baseObj}_tx_throughput`;
+
+    // Only open if both sensors exist.
+    if (!hass.states?.[rxEntityId] || !hass.states?.[txEntityId]) return false;
+
+    const st = hass.states[entity_id];
+    const attrs = st?.attributes || {};
+    const title = attrs.Name || baseObj;
+
+    // Fire and forget; dialog handles its own async rendering.
+    this._openBandwidthGraphDialog(title, rxEntityId, txEntityId);
+    return true;
+  }
+
+
   _openDialog(entity_id) {
     const st = this._hass?.states?.[entity_id]; if (!st) return;
     const attrs = st.attributes || {};
@@ -651,19 +1016,70 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
     this._modalEl = document.createElement("div");
     this._modalEl.className = "ssm-modal-root";
+    // Build modal rows (hide blank VLAN fields)
+    const _isBlank = (v) => {
+      if (v === null || v === undefined) return true;
+      if (Array.isArray(v)) return v.length === 0;
+      const s = String(v).trim();
+      if (s === "") return true;
+      const sl = s.toLowerCase();
+      return sl === "unknown" || sl === "unavailable" || sl === "none" || sl === "null";
+    };
+    const _first = (...vals) => {
+      for (const v of vals) {
+        if (!_isBlank(v)) return v;
+      }
+      return null;
+    };
+    const vlanId = _first(
+      attrs["VLAN ID"], attrs.vlan_id, attrs.VLAN_ID, attrs.VLAN, attrs.vlan
+    );
+    const nativeVlan = _first(
+      attrs["Native VLAN"], attrs.native_vlan, attrs.NativeVlan, attrs.nativeVlan
+    );
+    const allowedVlans = _first(
+      attrs["Allowed VLANs"], attrs.allowed_vlans, attrs.AllowedVlans, attrs.allowedVlans
+    );
+    const untaggedVlans = _first(
+      attrs["Untagged VLANs"], attrs.untagged_vlans, attrs.UntaggedVlans, attrs.untaggedVlans
+    );
+    const taggedVlans = _first(
+      attrs["Tagged VLANs"], attrs.tagged_vlans, attrs.TaggedVlans, attrs.taggedVlans,
+      attrs["Taggged VLANs"], attrs.taggged_vlans // tolerate misspelling
+    );
+    const trunk = _first(
+      attrs["Trunk"], attrs.trunk, attrs.is_trunk, attrs.IsTrunk
+    );
+
+    const _row = (label, value) => {
+      if (_isBlank(value)) return "";
+      return `<div><b>${label}</b> ${value}</div>`;
+    };
+
+    const rowsHtml = [
+      _row("Admin:", attrs.Admin ?? "-"),
+      _row("Oper:", attrs.Oper ?? "-"),
+      _row("Speed:", speed ?? "-"),
+      hasRates ? _row("RX:", `${rxRate} <span class="hint">(${rxTotS})</span>`) : "",
+      hasRates ? _row("TX:", `${txRate} <span class="hint">(${txTotS})</span>`) : "",
+      _row("VLAN ID:", vlanId),
+      _row("Native VLAN:", nativeVlan),
+      _row("Allowed VLANs:", allowedVlans),
+      _row("Untagged VLANs:", untaggedVlans),
+      _row("Tagged VLANs:", taggedVlans),
+      // show trunk if explicitly boolean or non-blank
+      (_isBlank(trunk) ? "" : _row("Trunk:", (typeof trunk === "boolean") ? (trunk ? "true" : "false") : trunk)),
+      _row("IP:", attrs.IP),
+      _row("Index:", attrs.Index ?? "-"),
+      // Alias row handled separately below
+    ].filter(Boolean).join("");
+
     this._modalEl.innerHTML = `
       <div class="ssm-backdrop"></div>
       <div class="ssm-modal" role="dialog" aria-modal="true">
         <div class="ssm-modal-title">${name}</div>
         <div class="ssm-modal-body">
-          <div><b>Admin:</b> ${attrs.Admin ?? "-"}</div>
-          <div><b>Oper:</b> ${attrs.Oper ?? "-"}</div>
-          <div><b>Speed:</b> ${speed ?? "-"}</div>
-          ${hasRates ? `<div><b>RX:</b> ${rxRate} <span class="hint">(${rxTotS})</span></div>` : ``}
-          ${hasRates ? `<div><b>TX:</b> ${txRate} <span class="hint">(${txTotS})</span></div>` : ``}
-          <div><b>VLAN ID:</b> ${vlan ?? "-"}</div>
-          ${ip}
-          <div><b>Index:</b> ${attrs.Index ?? "-"}</div>
+          ${rowsHtml}
           <div>
             <b>Alias:</b>
             <span class="alias-text">${aliasValue || "-"}</span>
@@ -790,12 +1206,12 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
 
   _calibStorageKey() {
-    // Persist calibration between re-renders / card re-instantiation (e.g. in the UI editor preview)
-    // Key is scoped per device prefix + card title + background image (so different models/images don't collide).
+    // Persist layout between re-renders / card re-instantiation (e.g. in the UI editor preview).
+    // Key is scoped per device prefix + background image so different devices/images don't collide.
+    // IMPORTANT: Do NOT include title (changing title should not break persistence).
     const prefix = this._inferDevicePrefix() || "unknown";
-    const title = String(this._config?.title || "");
     const bg = String(this._config?.background_image || "");
-    return `ssm_calib_v1:${prefix}:${title}:${bg}`;
+    return `ssm_calib_v2:${prefix}:${bg}`;
   }
 
   _loadCalibMapFromStorage() {
@@ -804,7 +1220,20 @@ class SnmpSwitchManagerCard extends HTMLElement {
       const raw = localStorage.getItem(key);
       if (!raw) return null;
       const obj = JSON.parse(raw);
-      return (obj && typeof obj === "object") ? obj : null;
+
+      // Backward compatible: older versions stored the map directly.
+      if (obj && typeof obj === "object" && !("map" in obj) && !("ts" in obj) && !("v" in obj)) {
+        return { v: 1, ts: 0, map: obj };
+      }
+
+      if (obj && typeof obj === "object" && obj.map && typeof obj.map === "object") {
+        const upl = (obj.uplink_box && typeof obj.uplink_box === "object") ? obj.uplink_box : null;
+        const pb = (obj.ports_box && typeof obj.ports_box === "object") ? obj.ports_box : null;
+        const po = (typeof obj.ports_order === "string") ? obj.ports_order : null;
+        return { v: Number(obj.v) || 2, ts: Number(obj.ts) || 0, map: obj.map, uplink_box: upl, ports_box: pb, ports_order: po };
+      }
+
+      return null;
     } catch (e) {
       return null;
     }
@@ -813,23 +1242,45 @@ class SnmpSwitchManagerCard extends HTMLElement {
   _persistCalibMapToStorage() {
     try {
       const key = this._calibStorageKey();
-      const obj = (this._calibMap && typeof this._calibMap === "object") ? this._calibMap : {};
+      const map = (this._calibMap && typeof this._calibMap === "object") ? this._calibMap : {};
+      const obj = {
+        v: 2,
+        ts: Date.now(),
+        map,
+        uplink_box: (this._calibUplinkBox && typeof this._calibUplinkBox === "object") ? this._calibUplinkBox : null,
+        ports_box: (this._calibPortsBox && typeof this._calibPortsBox === "object") ? this._calibPortsBox : null,
+        ports_order: (typeof this._calibPortsOrder === "string" && this._calibPortsOrder) ? this._calibPortsOrder : "numeric",
+      };
       localStorage.setItem(key, JSON.stringify(obj));
     } catch (e) {}
   }
 
   _persistCalibMapDebounced() {
-    clearTimeout(this._calibPersistT);
-    this._calibPersistT = setTimeout(() => this._persistCalibMapToStorage(), 150);
+    // IMPORTANT: Do NOT persist layout positions automatically.
+    // The user expects positions to be saved ONLY when clicking the Save button
+    // in the Layout Editor.
+    // Keep this method as a no-op for backward compatibility with older code paths.
+    return;
   }
 
   _setupCalibrationUI() {
     const enabled = !!this._config?.calibration_mode;
+
     // Clear any prior calibration state when disabled
     if (!enabled) {
       this._calibSelected = null;
+      this._calibSel = null;
       this._calibMap = null;
+      this._calibDirty = false;
+      this._calibSnap = 0;
+      this._calibAssist = null;
+      this._calibAssistPt1 = null;
       this._freezeRenderWhileCalibrationActive = false;
+      this._calibUplinkBox = null;
+      this._calibUplinkBoxMode = false;
+      this._calibPortsBox = null;
+      this._calibPortsBoxMode = false;
+      this._calibPortsOrder = null;
       return;
     }
 
@@ -838,239 +1289,1458 @@ class SnmpSwitchManagerCard extends HTMLElement {
     if (!svg) return;
 
     // Freeze re-renders from hass churn while calibration mode is active.
-    // Similar to the graph/modal fix: rebuilding the shadow DOM resets the textarea scroll
-    // and can cancel pointer capture mid-drag.
+    // Rebuilding the shadow DOM cancels pointer capture mid-drag and causes selection/textarea churn.
     this._freezeRenderWhileCalibrationActive = true;
 
     // Init map from config once, then keep it across renders while calibration mode is enabled.
-    // Otherwise any hass state refresh (or periodic re-render) will "snap" ports back to their
-    // original grid positions.
     if (!this._calibMap) {
-      // Prefer persisted (localStorage) calibration map first so positions don't snap back
-      // if Lovelace re-instantiates the card (common in the UI editor preview).
       const stored = this._loadCalibMapFromStorage();
-      if (stored) {
-        this._calibMap = stored;
+      if (stored && stored.map) {
+        this._calibMap = stored.map;
+        if (!this._calibPortsOrder && stored.ports_order) {
+          this._calibPortsOrder = String(stored.ports_order);
+        }
+        if (!this._calibUplinkBox && stored.uplink_box && typeof stored.uplink_box === "object") {
+          this._calibUplinkBox = stored.uplink_box;
+        }
+        if (!this._calibPortsBox && stored.ports_box && typeof stored.ports_box === "object") {
+          this._calibPortsBox = stored.ports_box;
+        }
       } else {
         const raw = (this._config.port_positions && typeof this._config.port_positions === "object") ? this._config.port_positions : {};
         this._calibMap = JSON.parse(JSON.stringify(raw || {}));
       }
+    this._calibDirty = false;
     }
-    this._calibSelected = this._calibSelected || null;
 
-    const elSelected = root.getElementById("ssm-calib-selected");
+    // Selection + snap state
+    this._calibSel = this._calibSel || new Set();
+    this._calibSnap = Number.isFinite(this._calibSnap) ? this._calibSnap : 0;
+    this._calibAssist = this._calibAssist || null;
+    this._calibAssistPt1 = this._calibAssistPt1 || null;
+    this._calibPortsOrder = (typeof this._calibPortsOrder === "string" && this._calibPortsOrder) ? this._calibPortsOrder : "numeric";
+
     const elXY = root.getElementById("ssm-calib-xy");
+    const elSelCount = root.getElementById("ssm-calib-selected-count");
+    const elMsg = root.getElementById("ssm-calib-msg");
+    const elSnap = root.getElementById("ssm-calib-snap");
+    const elOrder = root.getElementById("ssm-calib-order");
+    const elAdv = root.getElementById("ssm-calib-advanced");
+    const elAdvToggle = root.getElementById("ssm-calib-advanced-toggle");
     const elJson = root.getElementById("ssm-calib-json");
-    const crossV = root.getElementById("ssm-calib-cross-v");
-    const crossH = root.getElementById("ssm-calib-cross-h");
+    const marquee = root.getElementById("ssm-calib-marquee");
+    const portsBtn = root.getElementById("ssm-calib-portsbox");
+    const portsRect = root.getElementById("ssm-portsbox-rect");
+    const portsLayer = root.getElementById("ssm-portsbox-layer");
+    const portsHandles = Array.from(root.querySelectorAll(".ssm-portsbox-handle"));
+    const uplBtn = root.getElementById("ssm-calib-uplinkbox");
+    const uplRect = root.getElementById("ssm-uplinkbox-rect");
+    const uplLayer = root.getElementById("ssm-uplinkbox-layer");
+    const uplHandles = Array.from(root.querySelectorAll(".ssm-uplinkbox-handle"));
 
-    const applyPortXY = (g, x, y) => {
-      const rect = g?.querySelector?.("rect");
-      if (rect) {
-        rect.setAttribute("x", String(x));
-        rect.setAttribute("y", String(y));
-      }
-      const label = g?.querySelector?.("text.label");
-      if (label) {
-        const Ps = (Number.isFinite(this._config?.port_size) ? this._config.port_size : 18) * (Number.isFinite(this._config?.ports_scale) ? this._config.ports_scale : 1);
-        label.setAttribute("x", String(x + Ps / 2));
-        label.setAttribute("y", String(y + Ps + (Number.isFinite(this._config?.label_size) ? this._config.label_size : 8)));
+    const setMsg = (txt) => {
+      if (!elMsg) return;
+      elMsg.textContent = txt ? ` • ${txt}` : "";
+    };
+
+    const refreshSelCount = () => {
+      if (elSelCount) elSelCount.textContent = String(this._calibSel?.size || 0);
+    };
+
+    const refreshSelectionStyles = () => {
+      const sel = this._calibSel || new Set();
+      root.querySelectorAll('.port-svg[data-entity]').forEach(pg => {
+        const id = pg.getAttribute('data-entity');
+        if (id && sel.has(id)) pg.classList.add('calib-selected');
+        else pg.classList.remove('calib-selected');
+      });
+    };
+
+    const getPortRect = (g) => g?.querySelector("rect");
+    const getGXY = (g) => {
+      const r = getPortRect(g);
+      if (!r) return null;
+      const x = parseFloat(r.getAttribute("x"));
+      const y = parseFloat(r.getAttribute("y"));
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+      return { x, y };
+    };
+
+    const applySnap = (v) => {
+      const s = Number(this._calibSnap || 0);
+      if (!s || !Number.isFinite(s) || s <= 0) return v;
+      return Math.round(v / s) * s;
+    };
+
+    const setPortXY = (entityId, x, y) => {
+      if (!this._calibMap) this._calibMap = {};
+      // IMPORTANT: Persist positions keyed by PORT NAME (interface name), not entity_id.
+      // The card's layout application logic expects port_positions keys to match interface names.
+      const g = root.querySelector(`.port-svg[data-entity="${CSS.escape(entityId)}"]`);
+      const portName = (g && g.getAttribute("data-portname")) ? String(g.getAttribute("data-portname")).trim() : "";
+      const key = portName || entityId;
+      this._calibMap[key] = { x, y };
+      const r = getPortRect(g);
+      if (r) {
+        r.setAttribute("x", String(x));
+        r.setAttribute("y", String(y));
       }
     };
 
-    const refreshJson = () => {
-      if (elJson) {
-        // Updating textarea.value resets scroll; preserve user scroll position unless they're already at bottom.
-        const prevTop = elJson.scrollTop;
-        const prevHeight = elJson.scrollHeight;
-        const atBottom = (prevTop + elJson.clientHeight) >= (prevHeight - 8);
+    const refreshExport = () => {
+      if (!elJson) return;
+      const obj = (this._calibMap && typeof this._calibMap === "object") ? this._calibMap : {};
+      elJson.value = JSON.stringify(obj, null, 2);
+    };
 
-        elJson.value = Object.keys(this._calibMap || {}).length
-          ? JSON.stringify(this._calibMap, null, 2)
-          : "";
+    const clearMarquee = () => {
+      if (!marquee) return;
+      marquee.style.display = "none";
+      marquee.setAttribute("width", "0");
+      marquee.setAttribute("height", "0");
+    };
 
-        // Restore scroll
-        if (atBottom) {
-          elJson.scrollTop = elJson.scrollHeight;
-        } else {
-          elJson.scrollTop = prevTop;
+    const normBox = (b) => {
+      if (!b || typeof b !== "object") return null;
+      const x = Number(b.x); const y = Number(b.y);
+      const w = Number(b.w); const h = Number(b.h);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h)) return null;
+      return { x, y, w: Math.max(10, w), h: Math.max(10, h) };
+    };
+
+    // -----------------------------
+    // Layout Editor: Undo / Redo
+    // -----------------------------
+    // Stores in-memory history only while the Layout Editor is open.
+    const _calibHist = this._calibHist || (this._calibHist = { undo: [], redo: [], pending: null });
+    const MAX_HIST = 50;
+
+    const snapshotLayout = () => {
+      const snap = {
+        map: (this._calibMap && typeof this._calibMap === "object") ? this._calibMap : {},
+        portsBox: this._calibPortsBox || null,
+        uplinkBox: this._calibUplinkBox || null,
+        portsOrder: this._calibPortsOrder || "numeric",
+        snap: this._calibSnap || 0,
+      };
+      // JSON round-trip ensures a deep copy and keeps history small.
+      return JSON.stringify(snap);
+    };
+
+    const applySnapshot = (snapStr) => {
+      if (!snapStr) return;
+      let snap;
+      try { snap = JSON.parse(snapStr); } catch (e) { return; }
+
+      this._calibMap = (snap?.map && typeof snap.map === "object") ? snap.map : {};
+      this._calibPortsBox = snap?.portsBox || null;
+      this._calibUplinkBox = snap?.uplinkBox || null;
+      this._calibPortsOrder = snap?.portsOrder || "numeric";
+      this._calibSnap = snap?.snap || 0;
+
+      // Apply map -> SVG immediately
+      const gs = Array.from(root.querySelectorAll('.port-svg[data-entity]'));
+      gs.forEach(g => {
+        const id = g.getAttribute('data-entity');
+        const name = (g.getAttribute('data-portname') || '').trim();
+        const key = name || id;
+        const xy = (key && this._calibMap && this._calibMap[key]) ? this._calibMap[key] : null;
+        const r = getPortRect(g);
+        if (r && xy && Number.isFinite(Number(xy.x)) && Number.isFinite(Number(xy.y))) {
+          r.setAttribute('x', String(xy.x));
+          r.setAttribute('y', String(xy.y));
         }
-      }
-      if (elSelected) elSelected.textContent = this._calibSelected || "(click a port)";
-    };
-    refreshJson();
+      });
 
-    // Clicking a port selects it (no modal) + supports drag & drop positioning
+      // Refresh overlays + computed layouts
+      updatePortsBoxSvg();
+      updateUplinkBoxSvg();
+      if (this._calibPortsBoxMode) applyPortsBoxLayout();
+      if (this._calibUplinkBoxMode) applyUplinkBoxLayout();
+      refreshSelectionStyles();
+      refreshSelCount();
+      if (elSnap) elSnap.value = String(this._calibSnap || 0);
+      if (elOrder) {
+        try { elOrder.value = (this._calibPortsOrder === 'odd_even') ? 'odd_even' : 'numeric'; } catch (e) {}
+      }
+      if (elAdv?.style?.display !== 'none') refreshExport();
+      this._calibDirty = true;
+    };
+
+    const beginUndo = () => {
+      if (_calibHist.pending) return;
+      _calibHist.pending = snapshotLayout();
+    };
+
+    const commitUndo = () => {
+      if (!_calibHist.pending) return;
+      const before = _calibHist.pending;
+      _calibHist.pending = null;
+      const after = snapshotLayout();
+      if (before === after) return;
+
+      _calibHist.undo.push(before);
+      if (_calibHist.undo.length > MAX_HIST) _calibHist.undo.shift();
+      _calibHist.redo.length = 0;
+    };
+
+    const doUndo = () => {
+      const prev = _calibHist.undo.pop();
+      if (!prev) return;
+      _calibHist.redo.push(snapshotLayout());
+      applySnapshot(prev);
+    };
+
+    const doRedo = () => {
+      const next = _calibHist.redo.pop();
+      if (!next) return;
+      _calibHist.undo.push(snapshotLayout());
+      applySnapshot(next);
+    };
+
+    // Ports box (main/physical ports) overlay
+    const setPortsBoxVisible = (vis) => {
+      if (portsLayer) portsLayer.style.pointerEvents = vis ? "all" : "none";
+      if (portsRect) portsRect.style.display = vis ? "" : "none";
+      portsHandles.forEach(h => { h.style.display = vis ? "" : "none"; });
+    };
+
+    const updatePortsBoxSvg = () => {
+      const b = normBox(this._calibPortsBox);
+      if (!portsRect) return;
+      // Hide overlay when the tool is off (keep box data for later)
+      if (!this._calibPortsBoxMode) {
+        portsRect.style.display = "none";
+        portsHandles.forEach(h => (h.style.display = "none"));
+        return;
+      }
+      if (!b) {
+        // If the tool is enabled but the box hasn't been drawn yet, keep the
+        // elements hidden (no box yet), but do not change the tool mode.
+        portsRect.style.display = "none";
+        portsHandles.forEach(h => h.style.display = "none");
+        return;
+      }
+      portsRect.style.display = "";
+      portsRect.setAttribute("x", String(b.x));
+      portsRect.setAttribute("y", String(b.y));
+      portsRect.setAttribute("width", String(b.w));
+      portsRect.setAttribute("height", String(b.h));
+
+      const s = 10, hs = s/2;
+      const pts = {
+        nw: [b.x - hs, b.y - hs],
+        n:  [b.x + b.w/2 - hs, b.y - hs],
+        ne: [b.x + b.w - hs, b.y - hs],
+        e:  [b.x + b.w - hs, b.y + b.h/2 - hs],
+        se: [b.x + b.w - hs, b.y + b.h - hs],
+        s:  [b.x + b.w/2 - hs, b.y + b.h - hs],
+        sw: [b.x - hs, b.y + b.h - hs],
+        w:  [b.x - hs, b.y + b.h/2 - hs],
+      };
+      portsHandles.forEach(el => {
+        const k = el.getAttribute("data-h");
+        const p = pts[k];
+        if (!p) return;
+        el.setAttribute("x", String(p[0]));
+        el.setAttribute("y", String(p[1]));
+      });
+
+      // Ensure the box remains visible (with handles) whenever the tool is enabled.
+      // This prevents the box from disappearing after drawing, so users can resize
+      // it the same way as the Uplinks box.
+      if (this._calibPortsBoxMode) {
+        portsRect.style.display = "";
+        portsHandles.forEach(h => (h.style.display = ""));
+        if (portsLayer) portsLayer.style.pointerEvents = "all";
+      }
+    };
+
+    const applyPortsBoxLayout = () => {
+      const b = normBox(this._calibPortsBox);
+      if (!b) return;
+
+      // We place port SVG groups by translating their *top-left*.
+      // To keep ports fully inside the box (and allow tighter packing),
+      // we must account for the rendered port glyph width/height.
+      // Use the first visible port element as our sizing reference.
+      let portW = 0;
+      let portH = 0;
+      try {
+        const sample = svg.querySelector(".port-svg");
+        if (sample && typeof sample.getBBox === "function") {
+          const bb = sample.getBBox();
+          portW = Math.max(0, Number(bb?.width) || 0);
+          portH = Math.max(0, Number(bb?.height) || 0);
+        }
+      } catch (e) {}
+      // Fallbacks if getBBox() isn't available (should be rare)
+      if (!portW) portW = 18;
+      if (!portH) portH = 18;
+
+      const separateUplinks = !!this._config?.show_uplinks_separately;
+      const uplinkSet = new Set(((this._config?.uplink_ports || [])).map(s => String(s).trim().toLowerCase()).filter(Boolean));
+
+      const gs = Array.from(svg.querySelectorAll(".port-svg[data-entity]"));
+      const main = gs.map(g => ({
+        g,
+        id: g.getAttribute("data-entity"),
+        name: (g.getAttribute("data-portname") || "")
+      })).filter(p => p.id && (!separateUplinks || !uplinkSet.size || !uplinkSet.has(String(p.name||"").trim().toLowerCase())));
+      if (!main.length) return;
+
+      // Order: numeric (default) or odd/even (2-row)
+      const orderMode = (typeof this._calibPortsOrder === "string" && this._calibPortsOrder) ? this._calibPortsOrder : "numeric";
+
+      const portNum = (name) => {
+        const m = String(name || "").match(/(\d+)(?!.*\d)/);
+        return m ? parseInt(m[1], 10) : NaN;
+      };
+
+      if (orderMode === "odd_even") {
+        // Split into odd/even groups based on the last numeric component of the port name.
+        const odds = [];
+        const evens = [];
+        main.forEach(p => {
+          const n = portNum(p.name);
+          if (Number.isFinite(n) && (n % 2 === 0)) evens.push({ ...p, _n: n });
+          else odds.push({ ...p, _n: Number.isFinite(n) ? n : null });
+        });
+
+        const cmpNumThenNatural = (a,b) => {
+          const an = a._n, bn = b._n;
+          if (Number.isFinite(an) && Number.isFinite(bn) && an !== bn) return an - bn;
+          return _ssmNaturalPortCompare(a.name, b.name);
+        };
+
+        odds.sort(cmpNumThenNatural);
+        evens.sort(cmpNumThenNatural);
+
+        const w = Math.max(10, b.w);
+        const h = Math.max(10, b.h);
+        const cap = Math.max(1, parseInt(this._config?.ports_per_row, 10) || 24);
+
+        const maxLen = Math.max(odds.length, evens.length);
+        const cols = Math.max(1, Math.min(cap, maxLen || 1));
+
+        const hasEvenRow = evens.length > 0;
+        const rowGroupSize = hasEvenRow ? 2 : 1;
+        const groups = Math.max(1, Math.ceil(maxLen / cols));
+        const rows = groups * rowGroupSize;
+
+        // Fit ports *within* the box: last port top-left cannot exceed (x + w - portW)
+        const spanX = Math.max(0, w - portW);
+        const spanY = Math.max(0, h - portH);
+        const stepX = (cols > 1) ? (spanX / (cols - 1)) : 0;
+        const stepY = (rows > 1) ? (spanY / (rows - 1)) : 0;
+
+        const place = (arr, rowOffset) => {
+          arr.forEach((p, i) => {
+            const g = Math.floor(i / cols);
+            const c = i % cols;
+            const r = g * rowGroupSize + rowOffset;
+            const x = Number(b.x) + stepX * c;
+            const y = Number(b.y) + stepY * r;
+            setPortXY(p.id, applySnap(x), applySnap(y));
+          });
+        };
+
+        place(odds, 0);
+        if (hasEvenRow) place(evens, 1);
+      } else {
+        // Default: natural numeric-ish order by port name
+        main.sort((a,b)=>_ssmNaturalPortCompare(a.name,b.name));
+
+        const n = main.length;
+        const w = Math.max(10, b.w);
+        const h = Math.max(10, b.h);
+        const ratio = w / h;
+        const cap = Math.max(1, parseInt(this._config?.ports_per_row, 10) || 24);
+        const colsGuess = Math.max(1, Math.round(Math.sqrt(n * ratio)));
+        const cols = Math.min(cap, colsGuess);
+        const rows = Math.max(1, Math.ceil(n / cols));
+
+        const spanX = Math.max(0, w - portW);
+        const spanY = Math.max(0, h - portH);
+        const stepX = (cols > 1) ? (spanX / (cols - 1)) : 0;
+        const stepY = (rows > 1) ? (spanY / (rows - 1)) : 0;
+
+        main.forEach((p, idx) => {
+          const c = idx % cols;
+          const r = Math.floor(idx / cols);
+          const x = Number(b.x) + stepX * c;
+          const y = Number(b.y) + stepY * r;
+          setPortXY(p.id, applySnap(x), applySnap(y));
+        });
+      }
+    };
+
+    const setUplinkBoxVisible = (vis) => {
+      if (uplLayer) uplLayer.style.pointerEvents = vis ? "all" : "none";
+      if (uplRect) uplRect.style.display = vis ? "" : "none";
+      uplHandles.forEach(h => { h.style.display = vis ? "" : "none"; });
+    };
+
+    const updateUplinkBoxSvg = () => {
+      const b = normBox(this._calibUplinkBox);
+      if (!uplRect) return;
+      // Hide overlay when the tool is off (keep box data for later)
+      if (!this._calibUplinkBoxMode) {
+        uplRect.style.display = "none";
+        uplHandles.forEach(h => (h.style.display = "none"));
+        return;
+      }
+      if (!b) {
+        uplRect.style.display = "none";
+        uplHandles.forEach(h => h.style.display = "none");
+        return;
+      }
+      uplRect.style.display = "";
+      uplRect.setAttribute("x", String(b.x));
+      uplRect.setAttribute("y", String(b.y));
+      uplRect.setAttribute("width", String(b.w));
+      uplRect.setAttribute("height", String(b.h));
+
+      // Handles centered on corners/edges
+      const s = 10, hs = s/2;
+      const pts = {
+        nw: [b.x - hs, b.y - hs],
+        n:  [b.x + b.w/2 - hs, b.y - hs],
+        ne: [b.x + b.w - hs, b.y - hs],
+        e:  [b.x + b.w - hs, b.y + b.h/2 - hs],
+        se: [b.x + b.w - hs, b.y + b.h - hs],
+        s:  [b.x + b.w/2 - hs, b.y + b.h - hs],
+        sw: [b.x - hs, b.y + b.h - hs],
+        w:  [b.x - hs, b.y + b.h/2 - hs],
+      };
+      uplHandles.forEach(el => {
+        const k = el.getAttribute("data-h");
+        const p = pts[k];
+        if (!p) return;
+        el.setAttribute("x", String(p[0]));
+        el.setAttribute("y", String(p[1]));
+      });
+    };
+
+    const applyUplinkBoxLayout = () => {
+      const b = normBox(this._calibUplinkBox);
+      if (!b) return;
+      const separateUplinks = !!this._config?.show_uplinks_separately;
+      const uplinkSet = new Set(((this._config?.uplink_ports || [])).map(s => String(s).trim().toLowerCase()).filter(Boolean));
+      if (!separateUplinks || !uplinkSet.size) return;
+
+      const gs = Array.from(svg.querySelectorAll(".port-svg[data-entity]"));
+      const upl = gs.map(g => ({ g, id: g.getAttribute("data-entity"), name: (g.getAttribute("data-portname")||"") }))
+        .filter(p => p.id && uplinkSet.has(String(p.name||"").trim().toLowerCase()));
+      if (!upl.length) return;
+
+      const n = upl.length;
+      const w = Math.max(10, b.w);
+      const h = Math.max(10, b.h);
+      const ratio = w / h;
+      const cols = Math.max(1, Math.round(Math.sqrt(n * ratio)));
+      const rows = Math.max(1, Math.ceil(n / cols));
+      const stepX = (cols > 1) ? (w / (cols - 1)) : 0;
+      const stepY = (rows > 1) ? (h / (rows - 1)) : 0;
+
+      upl.forEach((p, idx) => {
+        const c = idx % cols;
+        const r = Math.floor(idx / cols);
+        const x = Number(b.x) + stepX * c;
+        const y = Number(b.y) + stepY * r;
+        setPortXY(p.id, applySnap(x), applySnap(y));
+      });
+    };
+
+    // Ports Box toggle (for main ports)
+    if (portsBtn && !portsBtn._ssmBound) {
+      portsBtn._ssmBound = true;
+      portsBtn.addEventListener("click", () => {
+        // Only one box tool active at a time
+        this._calibPortsBoxMode = !this._calibPortsBoxMode;
+        if (this._calibPortsBoxMode) {
+          this._calibUplinkBoxMode = false;
+          if (uplBtn) uplBtn.classList.remove("active");
+          setUplinkBoxVisible(false);
+        }
+
+        portsBtn.classList.toggle("active", !!this._calibPortsBoxMode);
+        setMsg(this._calibPortsBoxMode ? "Ports box: drag to draw, drag handles to resize" : "");
+        setPortsBoxVisible(!!this._calibPortsBoxMode);
+        // Order only applies to Ports box layout; show it only when Ports tool is active
+        const orderWrap = root.getElementById("ssm-calib-order-wrap");
+        if (orderWrap) orderWrap.style.display = this._calibPortsBoxMode ? "" : "none";
+
+        // Create a default box if enabling and none exists
+        if (this._calibPortsBoxMode && !normBox(this._calibPortsBox)) {
+          const vb = svg.viewBox?.baseVal;
+          const W = vb ? vb.width : 800;
+          const H = vb ? vb.height : 260;
+          // default to the main switch face area
+          this._calibPortsBox = { x: 20, y: 20, w: Math.max(220, W - 260), h: Math.max(120, H - 60) };
+        }
+
+        updatePortsBoxSvg();
+        applyPortsBoxLayout();
+        this._calibDirty = true;
+        refreshExport();
+      });
+    }
+
+    // Ports ordering for Ports box layout
+    if (elOrder) {
+      // Order only applies to Ports tool
+      const _orderWrap = root.getElementById("ssm-calib-order-wrap");
+      if (_orderWrap) _orderWrap.style.display = this._calibPortsBoxMode ? "" : "none";
+      try { elOrder.value = this._calibPortsOrder || "numeric"; } catch (e) {}
+      if (!elOrder._ssmBound) {
+        elOrder._ssmBound = true;
+        elOrder.addEventListener("change", () => {
+          this._calibPortsOrder = (elOrder.value || "numeric");
+          this._calibDirty = true;
+          // Reflow ports immediately if the Ports box tool is active
+          if (this._calibPortsBoxMode) {
+            applyPortsBoxLayout();
+            if (elAdv?.style?.display !== "none") refreshExport();
+          }
+        });
+      }
+    }
+
+
+    // Uplinks Box toggle (Smart Assist)
+    if (uplBtn && !uplBtn._ssmBound) {
+      uplBtn._ssmBound = true;
+      uplBtn.addEventListener("click", () => {
+        // Only one box tool active at a time
+        if (!this._calibUplinkBoxMode) {
+          this._calibPortsBoxMode = false;
+          if (portsBtn) portsBtn.classList.remove("active");
+          setPortsBoxVisible(false);
+        }
+        this._calibUplinkBoxMode = !this._calibUplinkBoxMode;
+        uplBtn.classList.toggle("active", !!this._calibUplinkBoxMode);
+        setMsg(this._calibUplinkBoxMode ? "Uplinks box: drag to draw, drag handles to resize" : "");
+        setUplinkBoxVisible(!!this._calibUplinkBoxMode);
+
+        // Create a default box if enabling and none exists
+        if (this._calibUplinkBoxMode && !normBox(this._calibUplinkBox)) {
+          const vb = svg.viewBox?.baseVal;
+          const W = vb ? vb.width : 800;
+          const H = vb ? vb.height : 260;
+          this._calibUplinkBox = { x: Math.max(10, W - 220), y: Math.max(10, 40), w: 200, h: 140 };
+          // Do NOT persist layout editor changes until the user explicitly clicks Save.
+        }
+        updateUplinkBoxSvg();
+        applyUplinkBoxLayout();
+        this._calibDirty = true;
+        refreshExport();
+      });
+    }
+
+    // Default: box overlays should NOT be visible unless their tool is enabled.
+    setPortsBoxVisible(!!this._calibPortsBoxMode);
+    if (this._calibPortsBoxMode) updatePortsBoxSvg();
+    setUplinkBoxVisible(!!this._calibUplinkBoxMode);
+    if (this._calibUplinkBoxMode) updateUplinkBoxSvg();
+
+    // Snap select
+
+    if (elSnap && !elSnap._ssmBound) {
+      elSnap._ssmBound = true;
+      elSnap.value = String(this._calibSnap || 0);
+      elSnap.addEventListener("change", () => {
+        this._calibSnap = parseInt(elSnap.value, 10) || 0;
+      });
+    }
+
+    // Advanced toggle
+    if (elAdvToggle && !elAdvToggle._ssmBound) {
+      elAdvToggle._ssmBound = true;
+      elAdvToggle.addEventListener("click", () => {
+        const show = (elAdv?.style?.display === "none");
+        if (elAdv) elAdv.style.display = show ? "block" : "none";
+        if (show) refreshExport();
+      });
+    }
+
+    // Copy JSON
+    root.getElementById("ssm-calib-copy-json")?.addEventListener("click", () => {
+      const txt = elJson?.value || "";
+      if (txt) this._copyToClipboard(txt);
+    });
+    // Apply / Format / Clear JSON (Advanced)
+    const elJsonErr = root.getElementById("ssm-calib-json-error");
+    const showJsonErr = (msg) => {
+      if (!elJsonErr) return;
+      if (msg) {
+        elJsonErr.textContent = msg;
+        elJsonErr.style.display = "block";
+      } else {
+        elJsonErr.textContent = "";
+        elJsonErr.style.display = "none";
+      }
+    };
+
+    root.getElementById("ssm-calib-apply-json")?.addEventListener("click", () => {
+      try {
+        showJsonErr("");
+        const raw = (elJson?.value || "").trim();
+        const obj = raw ? JSON.parse(raw) : {};
+        if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+          throw new Error("JSON must be an object mapping port names to {x,y}.");
+        }
+
+        // Build lookup for current SVG ports so we can apply by either Port Name or entity_id.
+        const portEls = Array.from(root.querySelectorAll(".port-svg[data-entity]"));
+        const byPortName = new Map();
+        const byEntity = new Map();
+        portEls.forEach((g) => {
+          const ent = String(g.getAttribute("data-entity") || "").trim();
+          const pn = String(g.getAttribute("data-portname") || "").trim();
+          if (ent) byEntity.set(ent.toLowerCase(), ent);
+          if (pn) byPortName.set(pn.toLowerCase(), ent);
+        });
+
+        // Normalize + validate, then apply directly to current SVG (no full re-render needed).
+        const next = {};
+        for (const [k, v] of Object.entries(obj)) {
+          const key = String(k || "").trim();
+          if (!key) continue;
+          if (!v || typeof v !== "object") continue;
+          const x = Number(v.x);
+          const y = Number(v.y);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+
+          const ent =
+            byPortName.get(key.toLowerCase()) ||
+            byEntity.get(key.toLowerCase()) ||
+            null;
+
+          if (!ent) continue;
+
+          const g = root.querySelector(`.port-svg[data-entity="${CSS.escape(ent)}"]`);
+          const pn = String(g?.getAttribute("data-portname") || "").trim() || key;
+          next[pn] = { x, y };
+
+          const r = g?.querySelector("rect");
+          if (r) {
+            r.setAttribute("x", String(x));
+            r.setAttribute("y", String(y));
+          }
+        }
+
+        this._calibMap = next;
+        this._calibDirty = true;
+
+        // Re-render once (temporarily bypassing freeze) so labels + overlays recompute correctly.
+        const prevFreeze = this._freezeRenderWhileCalibrationActive;
+        this._freezeRenderWhileCalibrationActive = false;
+        this._render();
+        this._freezeRenderWhileCalibrationActive = prevFreeze;
+
+        refreshExport();
+      } catch (e) {
+        showJsonErr(String(e?.message || e));
+      }
+    });
+    root.getElementById("ssm-calib-format-json")?.addEventListener("click", () => {
+      try {
+        showJsonErr("");
+        const raw = (elJson?.value || "").trim();
+        const obj = raw ? JSON.parse(raw) : {};
+        if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw new Error("JSON must be an object mapping port names to {x,y}.");
+        if (elJson) elJson.value = JSON.stringify(obj, null, 2);
+      } catch (e) {
+        showJsonErr(String(e?.message || e));
+      }
+    });
+
+    root.getElementById("ssm-calib-clear-json")?.addEventListener("click", () => {
+      showJsonErr("");
+      // Clear in-memory overrides (does NOT persist until Save is clicked)
+      this._calibMap = {};
+      if (elJson) elJson.value = "{}";
+      this._render();
+      refreshExport();
+    });
+
+
+    // Save / Reset
+    root.getElementById("ssm-calib-save")?.addEventListener("click", () => {
+      // Persist locally for immediate UX, and also emit an event so the editor can
+      // write the positions back into the card config (so it survives reloads).
+      this._persistCalibMapToStorage();
+      try {
+        this.dispatchEvent(new CustomEvent("ssm-port-positions-saved", {
+          detail: {
+            device: this._config?.device || "",
+            background_image: this._config?.background_image || "",
+            port_positions: (this._calibMap && typeof this._calibMap === "object") ? this._calibMap : {},
+          },
+          bubbles: true,
+          composed: true,
+        }));
+      } catch (e) {}
+      this._calibDirty = false;
+      setMsg("Saved");
+      setTimeout(() => setMsg(""), 1200);
+    });
+
+    // Undo / Redo (in-memory only while the Layout Editor is open)
+    root.getElementById("ssm-calib-undo")?.addEventListener("click", () => doUndo());
+    root.getElementById("ssm-calib-redo")?.addEventListener("click", () => doRedo());
+
+    root.getElementById("ssm-calib-reset")?.addEventListener("click", () => {
+      beginUndo();
+      this._calibMap = {};
+      this._calibSel = new Set();
+      refreshSelCount();
+      refreshSelectionStyles();
+      clearMarquee();
+      refreshExport();
+      // snap ports back by forcing a re-render next tick
+      this._freezeRenderWhileCalibrationActive = false;
+      this._render();
+      this._calibDirty = true;
+      commitUndo();
+    });
+
+    root.getElementById("ssm-calib-close")?.addEventListener("click", () => {
+      // Exit Layout Editor immediately.
+      this._freezeRenderWhileCalibrationActive = false;
+      // Persist a "force off" flag so the card editor toggle resets even if the editor is not open.
+      try {
+        const prefix = (this._config?.device || "") ? String(this._config.device) : "unknown";
+        const bg = String(this._config?.background_image || "");
+        localStorage.setItem(`ssm_calib_force_off:${prefix}:${bg}`, String(Date.now()));
+      } catch (e) {}
+      this._calibUiClosed = false;
+
+      // Ask the editor (if open) to turn the toggle off so it persists when you save.
+      try {
+        window.dispatchEvent(new CustomEvent("ssm-calibration-closed", {
+          detail: { device: this._config?.device || "" }
+        }));
+      } catch (e) {}
+
+      // Also emit a standard Lovelace editor event as a fallback (works when the card is shown in preview).
+      try {
+        const newCfg = { ...(this._config || {}), calibration_mode: false };
+        this._config = newCfg;
+        this.dispatchEvent(new CustomEvent("config-changed", {
+          detail: { config: newCfg },
+          bubbles: true,
+          composed: true,
+        }));
+      } catch (e) {
+        this._config = { ...(this._config || {}), calibration_mode: false };
+      }
+
+      this._render();
+    });
+
+    // Align / distribute helpers
+    const getSelectedGs = () => {
+      const sel = this._calibSel || new Set();
+      const gs = [];
+      sel.forEach(id => {
+        const g = root.querySelector(`.port-svg[data-entity="${CSS.escape(id)}"]`);
+        if (g) gs.push(g);
+      });
+      return gs;
+    };
+
+    const alignRow = () => {
+      const gs = getSelectedGs();
+      if (gs.length < 2) return;
+      const ref = getGXY(gs[0]);
+      if (!ref) return;
+      const y = ref.y;
+      gs.forEach(g => {
+        const id = g.getAttribute("data-entity");
+        const xy = getGXY(g);
+        if (!id || !xy) return;
+        setPortXY(id, xy.x, y);
+      });
+      this._calibDirty = true;
+      if (elAdv?.style?.display !== "none") refreshExport();
+    };
+
+    const alignCol = () => {
+      const gs = getSelectedGs();
+      if (gs.length < 2) return;
+      const ref = getGXY(gs[0]);
+      if (!ref) return;
+      const x = ref.x;
+      gs.forEach(g => {
+        const id = g.getAttribute("data-entity");
+        const xy = getGXY(g);
+        if (!id || !xy) return;
+        setPortXY(id, x, xy.y);
+      });
+      this._calibDirty = true;
+      if (elAdv?.style?.display !== "none") refreshExport();
+    };
+
+    const distribute = (axis) => {
+      const gs = getSelectedGs();
+      if (gs.length < 2) return;
+
+      const pts = gs
+        .map(g => ({ g, id: g.getAttribute("data-entity"), xy: getGXY(g) }))
+        .filter(o => o.id && o.xy);
+
+      if (pts.length < 2) return;
+
+      // With only 2 points, "distribute" is still useful: place the 2nd item at a sane default spacing
+      // (port size + gap) from the 1st item so it visibly does something for 2-row switches.
+      if (pts.length === 2) {
+        pts.sort((a,b)=> axis==="x" ? a.xy.x-b.xy.x : a.xy.y-b.xy.y);
+        const r0 = getPortRect(pts[0].g);
+        const size = r0 ? parseFloat(r0.getAttribute("width")) : NaN;
+        const gap = Number(this._config?.port_gap ?? 0);
+        const defaultStep = (Number.isFinite(size) ? size : 0) + (Number.isFinite(gap) ? gap : 0);
+
+        const v0 = pts[0].xy[axis];
+        const v1 = Number.isFinite(defaultStep) && defaultStep > 0 ? (v0 + defaultStep) : pts[1].xy[axis];
+
+        if (axis === "x") setPortXY(pts[1].id, v1, pts[1].xy.y);
+        else setPortXY(pts[1].id, pts[1].xy.x, v1);
+
+        this._calibDirty = true;
+        if (elAdv?.style?.display !== "none") refreshExport();
+        return;
+      }
+
+      pts.sort((a,b)=> axis==="x" ? a.xy.x-b.xy.x : a.xy.y-b.xy.y);
+      const first = pts[0].xy[axis], last = pts[pts.length-1].xy[axis];
+      const step = (last - first) / (pts.length - 1);
+      pts.forEach((p, i) => {
+        const v = first + step * i;
+        if (axis === "x") setPortXY(p.id, v, p.xy.y);
+        else setPortXY(p.id, p.xy.x, v);
+      });
+      this._calibDirty = true;
+      if (elAdv?.style?.display !== "none") refreshExport();
+    };
+
+    root.getElementById("ssm-calib-align-row")?.addEventListener("click", alignRow);
+    root.getElementById("ssm-calib-align-col")?.addEventListener("click", alignCol);
+    root.getElementById("ssm-calib-dist-h")?.addEventListener("click", () => distribute("x"));
+    root.getElementById("ssm-calib-dist-v")?.addEventListener("click", () => distribute("y"));
+    // Cursor coordinates + smart assist clicks + marquee select
+    const hit = root.getElementById("ssm-calib-hit");
+    if (hit && !hit._ssmBound) {
+      hit._ssmBound = true;
+
+      let boxSelecting = false;
+      let boxPid = null;
+      let boxStart = null;
+
+	      // Smart Assist drag-box state
+	      let saDragging = false;
+	      let saPid = null;
+	      let saStart = null;
+
+      // Uplinks Box interaction state
+      let ubActive = false;
+      let ubPid = null;
+      let ubKind = null; // "draw" | "move" | "resize"
+      let ubHandle = null; // handle key
+      let ubStart = null; // pointer start pt
+      let ubOrig = null;  // original box
+
+      // Ports Box interaction state
+      let pbActive = false;
+      let pbPid = null;
+      let pbKind = null; // "draw" | "move" | "resize"
+      let pbHandle = null;
+      let pbStart = null;
+      let pbOrig = null;
+	const onMove = (ev) => {
+        const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
+        if (elXY) elXY.textContent = `${Math.round(pt.x)}, ${Math.round(pt.y)}`;
+
+	        if (saDragging && saPid === ev.pointerId && saStart) {
+	          ev.preventDefault();
+	          const x1 = saStart.x, y1 = saStart.y;
+	          const x2 = pt.x, y2 = pt.y;
+	          const rx = Math.min(x1, x2);
+	          const ry = Math.min(y1, y2);
+	          const rw = Math.abs(x2 - x1);
+	          const rh = Math.abs(y2 - y1);
+	          if (marquee) {
+	            marquee.style.display = "block";
+	            marquee.setAttribute("x", String(rx));
+	            marquee.setAttribute("y", String(ry));
+	            marquee.setAttribute("width", String(rw));
+	            marquee.setAttribute("height", String(rh));
+	          }
+	          return;
+	        }
+
+        if (pbActive && pbPid === ev.pointerId && pbStart) {
+          ev.preventDefault();
+          const b0 = pbOrig || normBox(this._calibPortsBox) || { x: pt.x, y: pt.y, w: 240, h: 160 };
+          const dx = pt.x - pbStart.x;
+          const dy = pt.y - pbStart.y;
+
+          let nb = { ...b0 };
+          // Allow tight packing: keep minimums near the glyph size instead of large fixed values.
+          // This lets users shrink the box to reduce inter-port spacing.
+          let minW = 10, minH = 10;
+          try {
+            const sample = svg.querySelector('.port-svg');
+            if (sample && typeof sample.getBBox === 'function') {
+              const bb = sample.getBBox();
+              minW = Math.max(minW, (Number(bb?.width) || 0));
+              minH = Math.max(minH, (Number(bb?.height) || 0));
+            }
+          } catch (e) {}
+
+          if (pbKind === "draw") {
+            const x1 = pbStart.x, y1 = pbStart.y;
+            const x2 = pt.x, y2 = pt.y;
+            nb.x = Math.min(x1, x2);
+            nb.y = Math.min(y1, y2);
+            nb.w = Math.max(minW, Math.abs(x2 - x1));
+            nb.h = Math.max(minH, Math.abs(y2 - y1));
+          } else if (pbKind === "move") {
+            nb.x = b0.x + dx;
+            nb.y = b0.y + dy;
+          } else if (pbKind === "resize") {
+            const h = String(pbHandle || "");
+            if (h.includes("e")) nb.w = Math.max(minW, b0.w + dx);
+            if (h.includes("s")) nb.h = Math.max(minH, b0.h + dy);
+            if (h.includes("w")) {
+              const nw = Math.max(minW, b0.w - dx);
+              nb.x = b0.x + (b0.w - nw);
+              nb.w = nw;
+            }
+            if (h.includes("n")) {
+              const nh = Math.max(minH, b0.h - dy);
+              nb.y = b0.y + (b0.h - nh);
+              nb.h = nh;
+            }
+          }
+
+          this._calibPortsBox = nb;
+          updatePortsBoxSvg();
+          applyPortsBoxLayout();
+          this._calibDirty = true;
+          return;
+        }
+
+        if (ubActive && ubPid === ev.pointerId && ubStart) {
+          ev.preventDefault();
+          const b0 = ubOrig || normBox(this._calibUplinkBox) || { x: pt.x, y: pt.y, w: 120, h: 90 };
+          const dx = pt.x - ubStart.x;
+          const dy = pt.y - ubStart.y;
+
+          let nb = { ...b0 };
+
+          const minW = 40, minH = 30;
+
+          if (ubKind === "draw") {
+            const x1 = ubStart.x, y1 = ubStart.y;
+            const x2 = pt.x, y2 = pt.y;
+            nb.x = Math.min(x1, x2);
+            nb.y = Math.min(y1, y2);
+            nb.w = Math.max(minW, Math.abs(x2 - x1));
+            nb.h = Math.max(minH, Math.abs(y2 - y1));
+          } else if (ubKind === "move") {
+            nb.x = b0.x + dx;
+            nb.y = b0.y + dy;
+          } else if (ubKind === "resize") {
+            const h = String(ubHandle || "");
+            // edge/corner logic
+            if (h.includes("e")) nb.w = Math.max(minW, b0.w + dx);
+            if (h.includes("s")) nb.h = Math.max(minH, b0.h + dy);
+            if (h.includes("w")) { 
+              const nw = Math.max(minW, b0.w - dx);
+              nb.x = b0.x + (b0.w - nw);
+              nb.w = nw;
+            }
+            if (h.includes("n")) {
+              const nh = Math.max(minH, b0.h - dy);
+              nb.y = b0.y + (b0.h - nh);
+              nb.h = nh;
+            }
+          }
+
+          this._calibUplinkBox = nb;
+          updateUplinkBoxSvg();
+          applyUplinkBoxLayout();
+          this._calibDirty = true;
+          return;
+        }
+
+        if (boxSelecting && boxPid === ev.pointerId && boxStart) {
+          ev.preventDefault();
+          const x1 = boxStart.x, y1 = boxStart.y;
+          const x2 = pt.x, y2 = pt.y;
+          const rx = Math.min(x1, x2);
+          const ry = Math.min(y1, y2);
+          const rw = Math.abs(x2 - x1);
+          const rh = Math.abs(y2 - y1);
+          if (marquee) {
+            marquee.style.display = "block";
+            marquee.setAttribute("x", String(rx));
+            marquee.setAttribute("y", String(ry));
+            marquee.setAttribute("width", String(rw));
+            marquee.setAttribute("height", String(rh));
+          }
+        }
+      };
+
+	      const onUp = (ev) => {
+        const isPb = (pbPid === ev.pointerId);
+        const isUb = (ubPid === ev.pointerId);
+        const isBox = (boxPid === ev.pointerId);
+	        const isSa = (saPid === ev.pointerId);
+
+	        if (!isPb && !isUb && !isBox && !isSa) return;
+	        try { hit.releasePointerCapture(ev.pointerId); } catch (e) {}
+	        const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
+	        if (isSa && saDragging && saStart) {
+	          // Commit Smart Assist box
+	          saDragging = false;
+	          saPid = null;
+	          const pt2 = pt;
+	          const pt1 = saStart;
+	          saStart = null;
+	          clearMarquee();
+	          this._calibAssist = null;
+	          this._calibAssistPt1 = null;
+	          setMsg("Applying…");
+	
+	          const applySmartAssist = (pt1, pt2) => {
+	            // Build odd/top even/bottom two-row layout from currently rendered ports
+	            const gs = Array.from(root.querySelectorAll(".port-svg[data-entity]"));
+	            const ports = gs.map(g => {
+	              const id = g.getAttribute("data-entity");
+	              const name = g.getAttribute("data-portname") || "";
+	              const m = name.match(/(\d+)(?!.*\d)/);
+	              const n = m ? parseInt(m[1], 10) : NaN;
+	              return { id, name, n };
+	            }).filter(p => p.id);
+
+	            const uplinkSet = new Set(((this._config?.uplink_ports || [])).map(s => String(s).trim().toLowerCase()).filter(Boolean));
+	            const separateUplinks = !!this._config?.show_uplinks_separately;
+	            const uplinks = (separateUplinks && uplinkSet.size) ? ports.filter(p => uplinkSet.has(String(p.name||"").trim().toLowerCase())) : [];
+	            const mainPorts = (separateUplinks && uplinks.length) ? ports.filter(p => !uplinkSet.has(String(p.name||"").trim().toLowerCase())) : ports;
+
+	            const odds = mainPorts.filter(p => Number.isFinite(p.n) && (p.n % 2 === 1)).sort((a,b)=>a.n-b.n);
+	            const evens = mainPorts.filter(p => Number.isFinite(p.n) && (p.n % 2 === 0)).sort((a,b)=>a.n-b.n);
+	            const useTwoRow = odds.length && evens.length;
+
+	            const count = mainPorts.length;
+	            const cols = Math.max(1, Math.ceil(count / 2));
+	            const xMin = Math.min(pt1.x, pt2.x);
+	            const xMax = Math.max(pt1.x, pt2.x);
+	            const yTop = Math.min(pt1.y, pt2.y);
+	            const yBot = Math.max(pt1.y, pt2.y);
+
+	            // Smart Assist should create a visible, resizable Ports box from the drag bounds
+	            // (same UX concept as the Uplinks box). This is editor-only state and is NOT
+	            // persisted until the user explicitly clicks Save.
+	            try {
+	              this._calibPortsBox = {
+	                x: xMin,
+	                y: yTop,
+	                w: Math.max(80, xMax - xMin),
+	                h: Math.max(60, yBot - yTop),
+	              };
+	              this._calibPortsBoxMode = true;
+	              if (portsBtn) portsBtn.classList.add("active");
+	              setPortsBoxVisible(true);
+	              updatePortsBoxSvg();
+	            } catch (e) {}
+	            const step = (cols > 1) ? (xMax - xMin) / (cols - 1) : 0;
+	
+	            const placeSeq = (arr, y) => {
+	              arr.forEach((p, i) => {
+	                const x = xMin + step * i;
+	                setPortXY(p.id, applySnap(x), applySnap(y));
+	              });
+	            };
+
+	            if (useTwoRow) {
+	              placeSeq(odds, yTop);
+	              placeSeq(evens, yBot);
+	            } else {
+	              const top = mainPorts.slice(0, cols);
+	              const bot = mainPorts.slice(cols);
+	              placeSeq(top, yTop);
+	              placeSeq(bot, yBot);
+	            }
+
+	            // Place uplinks into Uplinks Box (grid)
+	            if (uplinks && uplinks.length) {
+	              const ensureBox = () => {
+	                if (this._calibUplinkBox && typeof this._calibUplinkBox === "object" && this._calibUplinkBox.w > 0 && this._calibUplinkBox.h > 0) {
+	                  return this._calibUplinkBox;
+	                }
+	                const pad = 16;
+	                const boxW = Math.max(120, Math.min(260, (xMax - xMin) * 0.45 || 200));
+	                const boxH = Math.max(90, Math.min(220, (yBot - yTop) || 160));
+	                const bx = xMax + pad;
+	                const by = yTop;
+	                this._calibUplinkBox = { x: bx, y: by, w: boxW, h: boxH };
+	                return this._calibUplinkBox;
+	              };
+	
+	              const box = ensureBox();
+	              // Make the Uplinks box visible/resizable after Smart Assist (editor-only state;
+	              // persisted only when the user clicks Save).
+	              try {
+	                this._calibUplinkBoxMode = true;
+	                if (uplBtn) uplBtn.classList.add("active");
+	                setUplinkBoxVisible(true);
+	                updateUplinkBoxSvg();
+	              } catch (e) {}
+	              const placeInBox = (arr, b) => {
+	                const n = arr.length;
+	                if (!n) return;
+	                const w = Math.max(10, Number(b.w) || 0);
+	                const h = Math.max(10, Number(b.h) || 0);
+	                const ratio = w / h;
+	                const cols = Math.max(1, Math.round(Math.sqrt(n * ratio)));
+	                const rows = Math.max(1, Math.ceil(n / cols));
+	                const stepX = (cols > 1) ? (w / (cols - 1)) : 0;
+	                const stepY = (rows > 1) ? (h / (rows - 1)) : 0;
+	                arr.forEach((p, idx) => {
+	                  const c = idx % cols;
+	                  const r = Math.floor(idx / cols);
+	                  const x = Number(b.x) + stepX * c;
+	                  const y = Number(b.y) + stepY * r;
+	                  setPortXY(p.id, applySnap(x), applySnap(y));
+	                });
+	              };
+	              placeInBox(uplinks, box);
+	            }
+
+	            this._calibDirty = true;
+	            if (elAdv?.style?.display !== "none") refreshExport();
+	            refreshSelCount();
+	          };
+
+	          applySmartAssist(pt1, pt2);
+	          setMsg("Done");
+	          setTimeout(() => setMsg(""), 1200);
+	
+	          window.removeEventListener("pointermove", onMove);
+	          window.removeEventListener("pointerup", onUp);
+	          return;
+	        }
+	        if (isPb && pbActive) {
+          // Commit ports box changes (do not persist until user clicks Save)
+          pbActive = false;
+          pbPid = null;
+          pbKind = null;
+          pbHandle = null;
+          pbStart = null;
+          pbOrig = null;
+          // Keep the ports box visible while the Ports box tool remains active,
+          // so users can immediately grab handles to resize (same UX as Uplinks box).
+          if (this._calibPortsBoxMode) setPortsBoxVisible(true);
+          updatePortsBoxSvg();
+          applyPortsBoxLayout();
+          setMsg("");
+          window.removeEventListener("pointermove", onMove);
+          window.removeEventListener("pointerup", onUp);
+          commitUndo();
+          return;
+        }
+
+        if (isUb && ubActive) {
+          // Commit uplinks box changes
+          ubActive = false;
+          ubPid = null;
+          ubKind = null;
+          ubHandle = null;
+          ubStart = null;
+          ubOrig = null;
+          // Do NOT persist layout editor changes until the user explicitly clicks Save.
+          updateUplinkBoxSvg();
+          applyUplinkBoxLayout();
+          setMsg("");
+          window.removeEventListener("pointermove", onMove);
+          window.removeEventListener("pointerup", onUp);
+          commitUndo();
+          return;
+        }
+if (boxSelecting && boxStart) {
+          const x1 = boxStart.x, y1 = boxStart.y;
+          const x2 = pt.x, y2 = pt.y;
+          const rx = Math.min(x1, x2);
+          const ry = Math.min(y1, y2);
+          const rw = Math.abs(x2 - x1);
+          const rh = Math.abs(y2 - y1);
+          clearMarquee();
+
+          const gs = Array.from(root.querySelectorAll(".port-svg[data-entity]"));
+          const next = new Set();
+          gs.forEach(g => {
+            const r = getPortRect(g);
+            if (!r) return;
+            const x = parseFloat(r.getAttribute("x"));
+            const y = parseFloat(r.getAttribute("y"));
+            if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+            if (x >= rx && x <= rx + rw && y >= ry && y <= ry + rh) {
+              const id = g.getAttribute("data-entity");
+              if (id) next.add(id);
+            }
+          });
+          this._calibSel = next;
+          refreshSelCount();
+          refreshSelectionStyles();
+          setMsg("");
+        }
+
+        boxSelecting = false;
+        boxPid = null;
+        boxStart = null;
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+      };
+
+      hit.addEventListener("pointermove", (ev) => {
+        const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
+        if (elXY) elXY.textContent = `${Math.round(pt.x)}, ${Math.round(pt.y)}`;
+      });
+
+      // Uplinks box: move/resize via rect + handles (only when mode is active)
+      // Ports box: move/resize via rect + handles (only when mode is active)
+      const startPbDrag = (ev, kind, handle) => {
+        if (!this._calibPortsBoxMode) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        beginUndo();
+        const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
+        pbActive = true;
+        pbPid = ev.pointerId;
+        pbKind = kind;
+        pbHandle = handle || null;
+        pbStart = pt;
+        pbOrig = normBox(this._calibPortsBox) || { x: pt.x, y: pt.y, w: 240, h: 160 };
+        setPortsBoxVisible(true);
+        updatePortsBoxSvg();
+        try { ev.target.setPointerCapture(ev.pointerId); } catch (e) {}
+        window.addEventListener("pointermove", onMove, { passive: false });
+        window.addEventListener("pointerup", onUp, { passive: false });
+      };
+
+      if (portsRect && !portsRect._ssmBound) {
+        portsRect._ssmBound = true;
+        portsRect.addEventListener("pointerdown", (ev) => startPbDrag(ev, "move", null));
+      }
+      portsHandles.forEach(h => {
+        if (h._ssmBound) return;
+        h._ssmBound = true;
+        h.addEventListener("pointerdown", (ev) => startPbDrag(ev, "resize", h.getAttribute("data-h")));
+      });
+
+      const startUbDrag = (ev, kind, handle) => {
+        if (!this._calibUplinkBoxMode) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        beginUndo();
+        const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
+        ubActive = true;
+        ubPid = ev.pointerId;
+        ubKind = kind;
+        ubHandle = handle || null;
+        ubStart = pt;
+        ubOrig = normBox(this._calibUplinkBox) || { x: pt.x, y: pt.y, w: 140, h: 100 };
+        setUplinkBoxVisible(true);
+        updateUplinkBoxSvg();
+        try { ev.target.setPointerCapture(ev.pointerId); } catch (e) {}
+        window.addEventListener("pointermove", onMove, { passive: false });
+        window.addEventListener("pointerup", onUp, { passive: false });
+      };
+
+      if (uplRect && !uplRect._ssmBound) {
+        uplRect._ssmBound = true;
+        uplRect.addEventListener("pointerdown", (ev) => startUbDrag(ev, "move", null));
+      }
+      uplHandles.forEach(h => {
+        if (h._ssmBound) return;
+        h._ssmBound = true;
+        h.addEventListener("pointerdown", (ev) => startUbDrag(ev, "resize", h.getAttribute("data-h")));
+      });
+
+
+	      hit.addEventListener("pointerdown", (ev) => {
+	        // Smart assist: click + drag to draw the bounds
+	        if (this._calibAssist === "drag") {
+	          const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
+	          saDragging = true;
+	          saPid = ev.pointerId;
+	          saStart = pt;
+	          this._calibAssistPt1 = pt;
+	          try { hit.setPointerCapture(ev.pointerId); } catch (e) {}
+	          window.addEventListener("pointermove", onMove, { passive: false });
+	          window.addEventListener("pointerup", onUp, { passive: false });
+	          return;
+	        }
+
+        // Ports box draw
+        if (this._calibPortsBoxMode) {
+          beginUndo();
+          pbActive = true;
+          pbPid = ev.pointerId;
+          pbKind = "draw";
+          pbHandle = null;
+          pbStart = this._svgPoint(svg, ev.clientX, ev.clientY);
+          pbOrig = null;
+          setPortsBoxVisible(true);
+          updatePortsBoxSvg();
+          try { hit.setPointerCapture(ev.pointerId); } catch (e) {}
+          window.addEventListener("pointermove", onMove, { passive: false });
+          window.addEventListener("pointerup", onUp, { passive: false });
+          return;
+        }
+
+        // Box select / Uplinks box draw
+        if (this._calibUplinkBoxMode) {
+          // Draw a new uplinks box (marquee-style)
+          beginUndo();
+          ubActive = true;
+          ubPid = ev.pointerId;
+          ubKind = "draw";
+          ubHandle = null;
+          ubStart = this._svgPoint(svg, ev.clientX, ev.clientY);
+          ubOrig = null;
+          setUplinkBoxVisible(true);
+          updateUplinkBoxSvg();
+          try { hit.setPointerCapture(ev.pointerId); } catch (e) {}
+          window.addEventListener("pointermove", onMove, { passive: false });
+          window.addEventListener("pointerup", onUp, { passive: false });
+          return;
+        }
+
+        boxSelecting = true;
+        boxPid = ev.pointerId;
+        boxStart = this._svgPoint(svg, ev.clientX, ev.clientY);
+        try { hit.setPointerCapture(ev.pointerId); } catch (e) {}
+        window.addEventListener("pointermove", onMove, { passive: false });
+        window.addEventListener("pointerup", onUp, { passive: false });
+}, { passive: true });
+    }
+
+    // Clicking + dragging ports: selection + group move
     root.querySelectorAll(".port-svg[data-entity]").forEach(g => {
       if (g._ssmCalibBound) return;
       g._ssmCalibBound = true;
 
       let dragging = false;
       let dragPointerId = null;
-      let dragDx = 0;
-      let dragDy = 0;
+      let dragStartPt = null;
+      let dragStartPositions = null;
 
-      let winMove = null;
-      let winEnd = null;
-
-      const onDragMove = (ev) => {
-        if (!dragging || dragPointerId !== ev.pointerId) return;
+      const onMove = (ev) => {
+        if (!dragging || dragPointerId !== ev.pointerId || !dragStartPt || !dragStartPositions) return;
         ev.preventDefault();
         const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
-        updateCrosshair(pt);
-        if (!pt || !this._calibSelected) return;
+        const dx = pt.x - dragStartPt.x;
+        const dy = pt.y - dragStartPt.y;
 
-        const nx = Math.round(pt.x - dragDx);
-        const ny = Math.round(pt.y - dragDy);
+        dragStartPositions.forEach((pos, id) => {
+          const x = applySnap(pos.x + dx);
+          const y = applySnap(pos.y + dy);
+          setPortXY(id, x, y);
+        });
 
-        this._calibMap = this._calibMap || {};
-        this._calibMap[this._calibSelected] = { x: nx, y: ny };
-        applyPortXY(g, nx, ny);
-        // Don't rewrite the JSON textarea on every mouse move. Updating textarea.value resets
-        // its scroll position and makes it impossible to read while dragging.
-        this._persistCalibMapDebounced();
+        if (elAdv?.style?.display !== "none") refreshExport();
+        this._calibDirty = true;
       };
 
-      const endDrag = (ev) => {
+      const onUp = (ev) => {
         if (dragPointerId !== ev.pointerId) return;
+        try { g.releasePointerCapture(ev.pointerId); } catch (e) {}
         dragging = false;
         dragPointerId = null;
-        this._freezeRenderWhileDragging = false;
+        dragStartPt = null;
+        dragStartPositions = null;
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
 
-        // Restore text selection/cursor
-        try {
-          if (this._calibPrevUserSelect !== undefined) document.body.style.userSelect = this._calibPrevUserSelect;
-          if (this._calibPrevCursor !== undefined) document.body.style.cursor = this._calibPrevCursor;
-        } catch (e) {}
-
-        refreshJson();
-
-        if (winMove) { window.removeEventListener("pointermove", winMove, true); winMove = null; }
-        if (winEnd) {
-          window.removeEventListener("pointerup", winEnd, true);
-          window.removeEventListener("pointercancel", winEnd, true);
-          winEnd = null;
-        }
-
-        try { svg.releasePointerCapture(ev.pointerId); } catch (e) {}
-        try { g.releasePointerCapture(ev.pointerId); } catch (e) {}
-      };
-
-      const getPortKey = () => {
-        const title = g.querySelector("title")?.textContent || "";
-        const name = g.getAttribute("data-portname") || title.split(" • ").slice(-1)[0] || "";
-        return String(name || "").trim();
-      };
-
-      const getCurrentXY = () => {
-        const rect = g.querySelector("rect");
-        const x = rect ? Number(rect.getAttribute("x")) : NaN;
-        const y = rect ? Number(rect.getAttribute("y")) : NaN;
-        return {
-          x: Number.isFinite(x) ? x : 0,
-          y: Number.isFinite(y) ? y : 0,
-        };
-      };
-
-      const selectPort = () => {
-        this._calibSelected = getPortKey();
-        root.querySelectorAll(".port-svg").forEach(x => x.classList.remove("calib-selected"));
-        g.classList.add("calib-selected");
-        refreshJson();
+        commitUndo();
       };
 
       g.addEventListener("pointerdown", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        selectPort();
 
-        // Mirror the prior modal/graph interaction fix: prevent text selection and keep a stable
-        // pointer interaction while dragging.
-        try {
-          this._calibPrevUserSelect = document.body.style.userSelect;
-          this._calibPrevCursor = document.body.style.cursor;
-          document.body.style.userSelect = "none";
-          document.body.style.cursor = "grabbing";
-        } catch (e) {}
+        const id = g.getAttribute("data-entity");
+        if (!id) return;
 
-        // Prevent Lovelace/state churn from re-rendering during an active drag (causes the drag to 'drop')
-        this._freezeRenderWhileDragging = true;
+        // Selection logic
+        if (ev.shiftKey) {
+          if (this._calibSel.has(id)) this._calibSel.delete(id);
+          else this._calibSel.add(id);
+        } else {
+          // If the clicked port is already part of the current multi-selection,
+          // keep the selection so users can drag the whole group.
+          // Only collapse to a single-item selection when clicking a different port.
+          if (!this._calibSel.has(id)) {
+            this._calibSel = new Set([id]);
+          }
+        }
+        refreshSelCount();
+        refreshSelectionStyles();
 
-        // Start dragging immediately; this feels natural for DnD positioning
-        const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
-        if (!pt) { this._freezeRenderWhileDragging = false; return; }
-        const cur = getCurrentXY();
+        // Track in-memory undo history for any drag/move operations.
+        beginUndo();
+
+        // Begin group drag for current selection
         dragging = true;
         dragPointerId = ev.pointerId;
-        dragDx = pt.x - cur.x;
-        dragDy = pt.y - cur.y;
-        try { g.setPointerCapture(ev.pointerId); } catch (e) {}
-        try { svg.setPointerCapture(ev.pointerId); } catch (e) {}
+        dragStartPt = this._svgPoint(svg, ev.clientX, ev.clientY);
+        dragStartPositions = new Map();
 
-        // Attach window-level handlers to keep dragging smooth even if pointer leaves the element
-        winMove = onDragMove.bind(this);
-        winEnd = endDrag.bind(this);
-        window.addEventListener("pointermove", winMove, true);
-        window.addEventListener("pointerup", winEnd, true);
-        window.addEventListener("pointercancel", winEnd, true);
+        this._calibSel.forEach(selId => {
+          const gg = root.querySelector(`.port-svg[data-entity="${CSS.escape(selId)}"]`);
+          const xy = getGXY(gg);
+          if (xy) dragStartPositions.set(selId, { x: xy.x, y: xy.y });
+        });
+
+        try { g.setPointerCapture(ev.pointerId); } catch (e) {}
+        window.addEventListener("pointermove", onMove, { passive: false });
+        window.addEventListener("pointerup", onUp, { passive: false });
       }, { passive: false });
     });
 
-    const updateCrosshair = (pt) => {
-      if (!pt) return;
-      if (crossV) { crossV.setAttribute("x1", pt.x); crossV.setAttribute("x2", pt.x); }
-      if (crossH) { crossH.setAttribute("y1", pt.y); crossH.setAttribute("y2", pt.y); }
-      if (elXY) elXY.textContent = `${Math.round(pt.x)}, ${Math.round(pt.y)}`;
-    };
-
-    // Pointer move / click on background to set selected port's position
-    const hit = root.getElementById("ssm-calib-hit");
-    if (hit && !hit._ssmBound) {
-      hit._ssmBound = true;
-      hit.addEventListener("pointermove", (ev) => {
-        const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
-        updateCrosshair(pt);
-      }, { passive: true });
-
-      hit.addEventListener("pointerdown", (ev) => {
-        const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
-        updateCrosshair(pt);
-        if (!pt || !this._calibSelected) return;
-
-        // Set top-left coords for the selected port
-        this._calibMap = this._calibMap || {};
-        this._calibMap[this._calibSelected] = { x: Math.round(pt.x), y: Math.round(pt.y) };
-        refreshJson();
-        this._persistCalibMapDebounced();
-      }, { passive: true });
-    }
-
-    // Buttons
-    root.getElementById("ssm-calib-copy-json")?.addEventListener("click", () => {
-      const txt = elJson?.value || "";
-      if (txt) this._copyToClipboard(txt);
-    });
-    root.getElementById("ssm-calib-copy-entry")?.addEventListener("click", () => {
-      if (!this._calibSelected) return;
-      const entry = this._calibMap?.[this._calibSelected];
-      if (!entry) return;
-      this._copyToClipboard(JSON.stringify({ [this._calibSelected]: entry }, null, 2));
-    });
-    root.getElementById("ssm-calib-clear")?.addEventListener("click", () => {
-      this._calibMap = {};
-      this._calibSelected = null;
-      root.querySelectorAll(".port-svg").forEach(x => x.classList.remove("calib-selected"));
-      refreshJson();
-      this._persistCalibMapDebounced();
-    });
+    // Initial refresh
+    refreshSelCount();
+    refreshSelectionStyles();
+    if (elSnap) elSnap.value = String(this._calibSnap || 0);
+    if (elAdv?.style?.display !== "none") refreshExport();
   }
+
 
 
   async _render() {
     if (!this.shadowRoot || !this._config || !this._hass) return;
 
     const data = await this._discoverEntities(); if (!data) return;
-    const { phys, virt, diag } = data;
+    let { phys, virt, diag } = data;
+
+    // Enforce Hide ports at render-time as a final guard (prevents any discovery path from re-introducing hidden ports)
+    const __hideSet = new Set(((this._config?.hide_ports || [])).map(s => String(s).trim().toLowerCase()).filter(Boolean));
+    if (__hideSet.size) {
+      const _isHidden = (id, st) => {
+        const a = st?.attributes || {};
+        const nRaw = String(a.Name || a.name || "").trim();
+        const nKey = nRaw.toLowerCase();
+        const idKey = String(id || "").trim().toLowerCase();
+        return (nKey && __hideSet.has(nKey)) || (idKey && __hideSet.has(idKey));
+      };
+      phys = phys.filter(([id, st]) => !_isHidden(id, st));
+      virt = virt.filter(([id, st]) => !_isHidden(id, st));
+    }
 
     const style = `
       :host { display:block; }
@@ -1079,8 +2749,12 @@ class SnmpSwitchManagerCard extends HTMLElement {
       .section { padding: 12px 16px; }
       .hint { opacity:.85; }
       .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(170px,1fr)); gap:10px; }
+      .subhead { font-weight:700; margin: 0 0 8px; }
+      .subsection { margin-top: 14px; }
       .port { border:1px solid var(--divider-color); border-radius:12px; padding:10px; background:var(--card-background-color); }
-      .name { font-weight:700; margin-bottom:6px; cursor:pointer; }
+      /* IMPORTANT: label_font_color is for Panel (SVG) labels only.
+         List view port names must always stay themed (primary text). */
+      .name { font-weight:700; margin-bottom:6px; cursor:pointer; color: var(--primary-text-color) !important; }
       .kv { font-size:12px; color:var(--secondary-text-color); margin-bottom:10px; }
       .dot { width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:6px; }
       .btn { font:inherit; padding:10px 12px; border-radius:10px; border:1px solid var(--divider-color); background:var(--secondary-background-color); cursor:pointer; }
@@ -1107,7 +2781,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
       svg { display:block; }
       svg[data-ssm-panel] { touch-action: none; }
       .port-svg { touch-action: none; }
-      .label { font-size: ${this._config.label_size}px; fill: var(--primary-text-color); opacity:.85; }
+      .portlabel{ font-size: ${this._config.label_size}px; color: ${this._config.label_color ? this._config.label_color : "var(--primary-text-color)"}; opacity:.85; }
       .panel-wrap { border-radius:12px; border:1px solid var(--divider-color);
         /* Prefer HA theme vars; fall back to card background for themes that don't set --ha-card-background */
         padding:6; background: color-mix(in oklab, var(--ha-card-background, var(--card-background-color, #1f2937)) 75%, transparent); }
@@ -1122,7 +2796,14 @@ class SnmpSwitchManagerCard extends HTMLElement {
       #ssm-calib-json{ width:100%; margin-top:10px; font-family:var(--code-font-family, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);
         font-size:12px; padding:10px; border-radius:10px; border:1px solid var(--divider-color); background:var(--card-background-color); color:var(--primary-text-color); box-sizing:border-box;
         height: 220px; overflow:auto; overscroll-behavior: contain; }
-      .calib-actions{ display:flex; gap:8px; justify-content:flex-end; margin-top:10px; flex-wrap:wrap; }
+      .calib-actions{ display:flex; gap:8px; justify-content:flex-start; margin-top:10px; flex-wrap:wrap; }
+      .calib-actions .iconbtn{ width:36px; height:36px; border-radius:10px; background: var(--card-background-color); box-shadow: 0 1px 2px rgba(0,0,0,0.25); border:none; cursor:pointer; display:flex; align-items:center; justify-content:center; padding:0; color: var(--primary-text-color); }
+      .calib-actions .iconbtn ha-icon{ --mdc-icon-size:20px; }
+      .calib-actions .iconbtn:hover{ filter: brightness(1.08); }
+      
+      .calib-inline{ display:flex; align-items:center; gap:6px; font-size:12px; color:var(--secondary-text-color); padding:4px 8px; border:1px solid var(--divider-color); border-radius:10px; }
+      .calib-inline select{ background:var(--card-background-color); color:var(--primary-text-color); border:1px solid var(--divider-color); border-radius:8px; padding:4px 6px; }
+      .calib-msg{ margin-left:8px; }
 
     `;
 
@@ -1168,13 +2849,17 @@ class SnmpSwitchManagerCard extends HTMLElement {
       const virtBox = (() => {
         if (this._config.hide_virtual_interfaces) return "";
         if (!virt.length) return "";
-        const rows = virt.map(([id, st]) => {
+        const rows = virt.filter(([id, st]) => {
+          const a = st.attributes || {};
+          const n = a.Name || id.split(".")[1] || id;
+          return !_ssmIsHiddenPort(this._config, n, id);
+        }).map(([id, st]) => {
           const a = st.attributes || {};
           const n = a.Name || id.split(".")[1] || id;
           const ip = a.IP ? ` — ${a.IP}` : "";
           const alias = a.Alias;
           const titleParts = [];
-          if (alias) titleParts.push(`Alias: ${alias}`);
+          if (alias) titleParts.push(`${alias}`);
           titleParts.push(`${n}${ip}`);
           const title = titleParts.join(" • ");
           return `<div class="virt-row" title="${title}">
@@ -1186,33 +2871,50 @@ class SnmpSwitchManagerCard extends HTMLElement {
         return `<div class="box"><div class="virt-title">Virtual Interfaces</div>${rows}</div>`;
       })();
 
+      // NOTE: "Show uplinks separately" is a Layout Editor feature only.
+      // Uplinks should NOT appear as a separate box in the rendered card.
       if (!diagBox && !virtBox) return "";
       return `<div class="info-grid">${diagBox}${virtBox}</div>`;
     })();
 
     const listView = () => {
-      const grid = phys.map(([id, st]) => {
+      // NOTE: "Show uplinks separately" is a Layout Editor feature only.
+      // In List view we do NOT split uplinks into a separate section.
+
+      const visiblePhys = phys.filter(([id, st]) => {
+        const a = st.attributes || {};
+        const name = a.Name || id.split(".")[1] || "";
+        return !_ssmIsHiddenPort(this._config, name, id);
+      });
+
+      const mainPhys = visiblePhys;
+
+      const renderPort = ([id, st]) => {
         const a = st.attributes || {};
         const name = a.Name || id.split(".")[1];
         const ip = a.IP ? ` • IP: ${a.IP}` : "";
         const alias = a.Alias;
         const titleParts = [];
-        if (alias) titleParts.push(`Alias: ${alias}`);
+        if (alias) titleParts.push(`${alias}`);
         titleParts.push(`${name}${ip}`);
         const title = titleParts.join(" • ");
         return `<div class="port" title="${title}">
           <div class="name" data-alias-entity="${id}">${name}</div>
           <div class="kv"><span class="dot" style="background:${this._colorFor(st)}"></span>
-            Admin: ${a.Admin ?? "-"} • Oper: ${a.Oper ?? "-"}${ip}
+            ${this._config.color_mode === "speed" ? `Speed: ${(this._speedLabelFromAttrs(a) || a.Speed || a.speed || "-")}` : `State: ${(a.Admin ?? "-")}/${(a.Oper ?? "-")}`}${ip}
           </div>
           <button class="btn wide" data-entity="${id}">${this._buttonLabel(st)}</button>
         </div>`;
-      }).join("");
+      };
+
+      const mainGrid = mainPhys.map(renderPort).join("");
 
       return `
         ${this._config.info_position === "above" ? infoGrid : ""}
         <div class="section">
-          ${phys.length ? `<div class="grid">${grid}</div>` : `<div class="hint">No physical ports discovered.</div>`}
+          ${mainPhys.length ? `
+            <div class="grid">${mainGrid}</div>
+          ` : `<div class="hint">No physical ports discovered.</div>`}
         </div>
         ${this._config.info_position === "below" ? infoGrid : ""}`;
     };
@@ -1246,18 +2948,29 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
       // Map keys are interface Names (e.g. "Gi1/0/1"). Matching is case-insensitive.
       // When calibration mode is enabled we may have a live (in-memory) map that differs from
       // config.port_positions. Use the live map so drag/drop doesn't snap back on refresh.
+      const stored = this._loadCalibMapFromStorage();
+      const storedMap = stored ? stored.map : null;
+
+      // Precedence:
+      // 1) Live map while Layout Editor is active
+      // 2) Persisted layout from localStorage (applies even when Layout Editor is off)
+      // 3) Config-provided port_positions (legacy/manual)
       const portPosRaw = (this._config.calibration_mode && this._calibMap && typeof this._calibMap === "object")
         ? this._calibMap
-        : ((this._config.port_positions && typeof this._config.port_positions === "object")
-            ? this._config.port_positions
-            : null);
+        : ((storedMap && typeof storedMap === "object")
+            ? storedMap
+            : ((this._config.port_positions && typeof this._config.port_positions === "object")
+                ? this._config.port_positions
+                : null));
       const portPos = portPosRaw
         ? new Map(Object.entries(portPosRaw).map(([k, v]) => [String(k).trim().toLowerCase(), v]))
         : null;
 
+      const labels = [];
       const rects = panelPorts.map(([id, st], i) => {
         const a = st.attributes || {};
         const name = String(a.Name || id.split(".")[1] || "");
+        if (_ssmIsHiddenPort(this._config, name, id)) return "";
         const alias = a.Alias;
         const idx = i % perRow, row = Math.floor(i / perRow);
         let x = sidePad + idx * slotW + (slotW - P) / 2;
@@ -1280,11 +2993,33 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
         y += offY;
         const fill = this._colorFor(st);
         const Ps = P * scale;
-        const label = this._config.show_labels
-          ? `<text class="label" x="${x + Ps / 2}" y="${y + Ps + this._config.label_size}" text-anchor="middle">${name}</text>`
-          : "";
+        const labelColor = this._config.label_color || this._config.label_font_color || "var(--primary-text-color)";
+        const labelBg = this._config.label_bg_color || this._config.label_background_color || "";
+        if (this._config.show_labels) {
+          const fs = Math.max(1, Number(this._config.label_size) || 8);
+          const rawNm = String(name);
+          const numbersOnly = !!this._config.label_numbers_only;
+          const nm = (() => {
+            if (!numbersOnly) return rawNm;
+            const s = rawNm;
+            const last = s.includes("/") ? s.split("/").pop() : s;
+            return /^[0-9]+$/.test(last || "") ? last : s;
+          })();
+          // Make the background as tight as practical while staying readable.
+          // SVG text is proportional; this is an estimate, not a measurement.
+          const padX = 1.2;
+          const padY = 1.4;
+          const estW = Math.max(6, (nm.length * fs * 0.48) + (padX * 2));
+          const rectX = (x + Ps / 2) - (estW / 2);
+          const rectY = y + Ps + 2;
+          const rectH = fs + (padY * 2);
+          const textY = rectY + fs + padY - 0.5;
+          const bg = String(labelBg || "").trim();
+          const bgRect = bg ? `<rect x="${rectX}" y="${rectY}" width="${estW}" height="${rectH}" rx="2" ry="2" fill="${bg}" style="pointer-events:none"></rect>` : "";
+          labels.push(`${bgRect}<text class="portlabel" x="${x + Ps / 2}" y="${textY}" text-anchor="middle" dominant-baseline="alphabetic" style="pointer-events:none; fill:${labelColor};" fill="${labelColor}">${nm}</text>`);
+        }
         const titleParts = [];
-        if (alias) titleParts.push(`Alias: ${alias}`);
+        if (alias) titleParts.push(`${alias}`);
         titleParts.push(name);
         const title = this._htmlEscape(titleParts.join(" • "));
         return `
@@ -1292,8 +3027,7 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
             <title>${title}</title>
             <rect x="${x}" y="${y}" width="${Ps}" height="${Ps}" rx="${Math.round(Ps * 0.2)}"
               fill="${fill}" stroke="rgba(0,0,0,.35)"/>
-            ${label}
-          </g>`;
+            </g>`;
       }).join("");
 
       const svg = `
@@ -1307,12 +3041,47 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
 
             ${plate}
             ${rects}
+            <g id="ssm-label-layer" style="pointer-events:none">
+              ${labels.join("")}
+            </g>
             ${this._config.calibration_mode ? `
-              <g id="ssm-calib-layer" style="pointer-events:none">
+              <g id="ssm-calib-layer" style="pointer-events:none"><rect id="ssm-calib-marquee" x="0" y="0" width="0" height="0" fill="rgba(0,150,255,.15)" stroke="rgba(0,150,255,.6)" stroke-width="1" style="display:none"></rect>
                 <line id="ssm-calib-cross-v" x1="0" y1="0" x2="0" y2="${H}" stroke="rgba(255,255,255,.35)" stroke-width="1"></line>
                 <line id="ssm-calib-cross-h" x1="0" y1="0" x2="${W}" y2="0" stroke="rgba(255,255,255,.35)" stroke-width="1"></line>
               </g>
-            ` : ``}
+
+              <g id="ssm-portsbox-layer" style="pointer-events:none">
+                <rect id="ssm-portsbox-rect" x="0" y="0" width="0" height="0"
+                  fill="rgba(0,150,255,0.08)" stroke="rgba(0,150,255,0.75)" stroke-width="2"
+                  stroke-dasharray="6 4" rx="6" ry="6" style="display:none"></rect>
+                <!-- 8 resize handles -->
+                <rect class="ssm-portsbox-handle" data-h="nw" x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.85)" stroke="rgba(255,255,255,0.75)" stroke-width="1" style="display:none"></rect>
+                <rect class="ssm-portsbox-handle" data-h="n"  x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.85)" stroke="rgba(255,255,255,0.75)" stroke-width="1" style="display:none"></rect>
+                <rect class="ssm-portsbox-handle" data-h="ne" x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.85)" stroke="rgba(255,255,255,0.75)" stroke-width="1" style="display:none"></rect>
+                <rect class="ssm-portsbox-handle" data-h="e"  x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.85)" stroke="rgba(255,255,255,0.75)" stroke-width="1" style="display:none"></rect>
+                <rect class="ssm-portsbox-handle" data-h="se" x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.85)" stroke="rgba(255,255,255,0.75)" stroke-width="1" style="display:none"></rect>
+                <rect class="ssm-portsbox-handle" data-h="s"  x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.85)" stroke="rgba(255,255,255,0.75)" stroke-width="1" style="display:none"></rect>
+                <rect class="ssm-portsbox-handle" data-h="sw" x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.85)" stroke="rgba(255,255,255,0.75)" stroke-width="1" style="display:none"></rect>
+                <rect class="ssm-portsbox-handle" data-h="w"  x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.85)" stroke="rgba(255,255,255,0.75)" stroke-width="1" style="display:none"></rect>
+              </g>
+            
+              ${this._config.show_uplinks_separately ? `
+              <g id="ssm-uplinkbox-layer" style="pointer-events:none">
+                <rect id="ssm-uplinkbox-rect" x="0" y="0" width="0" height="0"
+                  fill="rgba(0,150,255,0.10)" stroke="rgba(0,150,255,0.85)" stroke-width="2"
+                  stroke-dasharray="6 4" rx="6" ry="6" style="display:none"></rect>
+                <!-- 8 resize handles -->
+                <rect class="ssm-uplinkbox-handle" data-h="nw" x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.95)" stroke="rgba(255,255,255,0.85)" stroke-width="1" style="display:none"></rect>
+                <rect class="ssm-uplinkbox-handle" data-h="n"  x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.95)" stroke="rgba(255,255,255,0.85)" stroke-width="1" style="display:none"></rect>
+                <rect class="ssm-uplinkbox-handle" data-h="ne" x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.95)" stroke="rgba(255,255,255,0.85)" stroke-width="1" style="display:none"></rect>
+                <rect class="ssm-uplinkbox-handle" data-h="e"  x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.95)" stroke="rgba(255,255,255,0.85)" stroke-width="1" style="display:none"></rect>
+                <rect class="ssm-uplinkbox-handle" data-h="se" x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.95)" stroke="rgba(255,255,255,0.85)" stroke-width="1" style="display:none"></rect>
+                <rect class="ssm-uplinkbox-handle" data-h="s"  x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.95)" stroke="rgba(255,255,255,0.85)" stroke-width="1" style="display:none"></rect>
+                <rect class="ssm-uplinkbox-handle" data-h="sw" x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.95)" stroke="rgba(255,255,255,0.85)" stroke-width="1" style="display:none"></rect>
+                <rect class="ssm-uplinkbox-handle" data-h="w"  x="0" y="0" width="10" height="10" rx="2" ry="2" fill="rgba(0,150,255,0.95)" stroke="rgba(255,255,255,0.85)" stroke-width="1" style="display:none"></rect>
+              </g>
+              ` : ``}
+` : ``}
           </svg>
         </div>`;
 
@@ -1322,17 +3091,67 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
         ${this._config.calibration_mode ? `
           <div class="calib-tools">
             <div class="calib-row">
-              <div class="calib-title">Calibration mode</div>
-              <div class="calib-status">Selected: <span id="ssm-calib-selected">(click a port)</span> • Cursor: <span id="ssm-calib-xy">-</span></div>
+              <div class="calib-title">Layout Editor</div>
+              <div class="calib-status">
+                Selected: <span id="ssm-calib-selected-count">0</span>
+                • Cursor: <span id="ssm-calib-xy">-</span>
+                <span id="ssm-calib-msg" class="calib-msg"></span>
+              </div>
             </div>
+
             <div class="calib-hint">
-              1) Drag and drop ports to the desired positions  2) Copy JSON and paste into <b>Port positions</b> box in <b>Settings</b>
+              Drag ports to reposition • Shift-click to multi-select • Drag empty space to box-select.
+              Use Align/Distribute for clean rows/columns. Click Save to persist locally.
             </div>
-            <textarea id="ssm-calib-json" rows="8" readonly></textarea>
+
             <div class="calib-actions">
-              <button class="btn" id="ssm-calib-copy-entry" type="button">Copy selected entry</button>
-              <button class="btn" id="ssm-calib-copy-json" type="button">Copy full JSON</button>
-              <button class="btn subtle" id="ssm-calib-clear" type="button">Clear</button>
+              <button class="iconbtn" id="ssm-calib-save" type="button" title="Save"><ha-icon icon="mdi:content-save"></ha-icon></button>
+              <button class="iconbtn" id="ssm-calib-reset" type="button" title="Reset"><ha-icon icon="mdi:restore"></ha-icon></button>
+<button class="iconbtn" id="ssm-calib-undo" type="button" title="Undo"><ha-icon icon="mdi:undo"></ha-icon></button>
+              <button class="iconbtn" id="ssm-calib-redo" type="button" title="Redo"><ha-icon icon="mdi:redo"></ha-icon></button>
+
+              <button class="iconbtn" id="ssm-calib-portsbox" type="button" title="Ports"><ha-icon icon="mdi:ethernet"></ha-icon></button>
+              ${this._config.show_uplinks_separately ? `<button class="iconbtn" id="ssm-calib-uplinkbox" type="button" title="Uplinks"><ha-icon icon="mdi:arrow-up-bold"></ha-icon></button>` : ``}
+
+              <label class="calib-inline">
+                Snap
+                <select id="ssm-calib-snap">
+                  <option value="0">Off</option>
+                  <option value="2">2px</option>
+                  <option value="5">5px</option>
+                  <option value="10">10px</option>
+                </select>
+              </label>
+
+              <label class="calib-inline" id="ssm-calib-order-wrap" style="display:none">
+                Order
+                <select id="ssm-calib-order">
+                  <option value="numeric">Numeric</option>
+                  <option value="odd_even">Odd/Even</option>
+                </select>
+              </label>
+
+              <button class="iconbtn" id="ssm-calib-align-row" type="button" title="Align row"><ha-icon icon="mdi:table-row"></ha-icon></button>
+              <button class="iconbtn" id="ssm-calib-align-col" type="button" title="Align column"><ha-icon icon="mdi:table-column"></ha-icon></button>
+              <button class="iconbtn" id="ssm-calib-dist-h" type="button" title="Distribute horizontally"><ha-icon icon="mdi:arrow-left-right-bold"></ha-icon></button>
+              <button class="iconbtn" id="ssm-calib-dist-v" type="button" title="Distribute vertically"><ha-icon icon="mdi:arrow-up-down-bold"></ha-icon></button>
+
+              <button class="iconbtn" id="ssm-calib-advanced-toggle" type="button" title="Advanced"><ha-icon icon="mdi:cog"></ha-icon></button>
+              <button class="iconbtn" id="ssm-calib-close" type="button" title="Exit Layout Editor"><ha-icon icon="mdi:close"></ha-icon></button>
+</div>
+
+            <div id="ssm-calib-advanced" style="display:none">
+              <div class="calib-hint" style="margin-top:8px">
+                Advanced layout JSON (optional). Edit and click Apply to preview. Click Save to persist.
+              </div>
+              <textarea id="ssm-calib-json" rows="10" spellcheck="false"></textarea>
+              <div id="ssm-calib-json-error" class="calib-hint" style="margin-top:6px; color: var(--error-color); display:none"></div>
+              <div class="calib-actions" style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap">
+                <button class="btn" id="ssm-calib-apply-json" type="button">Apply</button>
+                <button class="btn" id="ssm-calib-format-json" type="button">Format</button>
+                <button class="btn" id="ssm-calib-clear-json" type="button">Reset positions</button>
+                <button class="btn" id="ssm-calib-copy-json" type="button">Copy JSON</button>
+              </div>
             </div>
           </div>
         ` : ``}
@@ -1349,6 +3168,13 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
         ${body}
       </ha-card>
     `;
+
+
+    // Ensure Home Assistant UI elements (ha-icon-button/ha-icon) render correctly
+    // by passing the hass object into them.
+    this.shadowRoot.querySelectorAll("ha-icon").forEach((el) => {
+      try { el.hass = this._hass; } catch (e) {}
+    });
 
     // wire list + virtual toggle buttons (keep click)
     this.shadowRoot.querySelectorAll(".btn[data-entity]").forEach(btn => {
@@ -1367,7 +3193,10 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
         const id = el.getAttribute("data-alias-entity");
         if (!id) return;
         if (el.classList.contains("name")) {
-          this._openDialog(id);
+          if ((this._config?.color_mode || "state") === "speed" && this._config?.speed_click_opens_graph) {
+          if (this._maybeOpenBandwidthGraphForPort(id)) return;
+        }
+        this._openDialog(id);
           return;
         }
         const st = this._hass?.states?.[id];
@@ -1380,7 +3209,10 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
           const id = el.getAttribute("data-alias-entity");
           if (!id) return;
           if (el.classList.contains("name")) {
-            this._openDialog(id);
+            if ((this._config?.color_mode || "state") === "speed" && this._config?.speed_click_opens_graph) {
+          if (this._maybeOpenBandwidthGraphForPort(id)) return;
+        }
+        this._openDialog(id);
             return;
           }
           const st = this._hass?.states?.[id];
@@ -1398,6 +3230,9 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
         const id = g.getAttribute("data-entity");
         if (!id) return;
         if (this._config?.calibration_mode) return; // handled by calibration helper
+        if ((this._config?.color_mode || "state") === "speed" && this._config?.speed_click_opens_graph) {
+          if (this._maybeOpenBandwidthGraphForPort(id)) return;
+        }
         this._openDialog(id);
       });
       g.addEventListener("keypress", (ev) => {
@@ -1464,6 +3299,7 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
         port_size: 18,
         gap: 10,
         show_labels: true,
+        label_numbers_only: false,
         label_size: 8,
         info_position: "above",
         hide_diagnostics: false,
@@ -1484,35 +3320,354 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
         this._hasConfig = false;
         this._hasHass = false;
         this._rendered = false;
+
+        // Draft state to prevent config churn while typing (prevents focus loss)
+        this._editingTitle = false;
+        this._draftTitle = null;
+        // Cache port entity ids per switch prefix (device) to avoid scanning all hass.states
+        this._portEidsByPrefix = null;
+        this._didVirtualMigrate = false;
+      
+        // Listen for saved calibration positions from the live card preview
+        this._onSsmPositionsSaved = (ev) => {
+          const d = ev && ev.detail ? ev.detail : null;
+          if (!d || !d.port_positions || typeof d.port_positions !== "object") return;
+          // Match by selected device prefix to avoid cross-talk
+          if ((d.device || "") !== (this._config?.device || "")) return;
+          this._updateConfig("port_positions", d.port_positions);
+        };
+
+        // Listen for "exit layout editor" from the live card preview so the toggle resets in the UI
+        this._onSsmCalibrationClosed = (ev) => {
+          const d = ev && ev.detail ? ev.detail : {};
+          if (d.device && this._config?.device && (d.device || "") !== (this._config?.device || "")) return;
+          if (!this._config?.calibration_mode) return;
+          this._updateConfig("calibration_mode", false);
+        };
+
+      }
+
+
+      connectedCallback() {
+        if (this._ssmPosListenerAdded) return;
+        this._ssmPosListenerAdded = true;
+        window.addEventListener("ssm-port-positions-saved", this._onSsmPositionsSaved);
+        window.addEventListener("ssm-calibration-closed", this._onSsmCalibrationClosed);
+      }
+
+      disconnectedCallback() {
+        if (!this._ssmPosListenerAdded) return;
+        this._ssmPosListenerAdded = false;
+        window.removeEventListener("ssm-port-positions-saved", this._onSsmPositionsSaved);
+        window.removeEventListener("ssm-calibration-closed", this._onSsmCalibrationClosed);
+      }
+
+      _defaultSpeedPalette() {
+        return {
+          "10 Mbps": "#9ca3af",
+          "100 Mbps": "#f59e0b",
+          "1 Gbps": "#22c55e",
+          "2.5 Gbps": "#14b8a6",
+          "5 Gbps": "#0ea5e9",
+          "10 Gbps": "#3b82f6",
+          "20 Gbps": "#6366f1",
+          "25 Gbps": "#8b5cf6",
+          "40 Gbps": "#a855f7",
+          "50 Gbps": "#d946ef",
+          "100 Gbps": "#ec4899",
+          "Unknown": "#ef4444",
+        };
+      }
+
+
+
+      _stateLabel(key) {
+        switch (key) {
+          case "up_up": return "Up/Up";
+          case "up_down": return "Up/Down";
+          case "down_down": return "Admin Down";
+          case "up_not_present": return "Not Present";
+          default: return key;
+        }
+      }
+
+      _diagnosticLabel(key) {
+      const k = String(key || "");
+      const map = {
+        hostname: "Hostname",
+        manufacturer: "Manufacturer",
+        model: "Model",
+        firmware: "Firmware Revision",
+        firmware_revision: "Firmware Revision",
+        uptime: "Uptime",
+      };
+      if (map[k]) return map[k];
+      if (this._hass && this._hass.states && this._hass.states[k]) {
+        return this._hass.states[k].attributes.friendly_name || k;
+      }
+      return k;
+    }
+
+
+      _defaultStatePalette() {
+        // Defaults match the card's current state mode legend.
+        // Keys are internal and stable; UI can present friendly labels.
+        return {
+          "up_up": "#22c55e",           // Green — Admin: Up • Oper: Up
+          "up_down": "#ef4444",         // Red — Admin: Up • Oper: Down
+          "down_down": "#f59e0b",       // Orange — Admin: Down • Oper: Down
+          "up_not_present": "#9ca3af",  // Gray — Admin: Up • Oper: Not Present
+        };
+      }
+
+
+      _speedLabelFromAttrs(attrs) {
+        if (!attrs) return null;
+        const candidates = [
+          attrs.SpeedLabel, attrs.speed_label, attrs.speedLabel, attrs.speedText, attrs.speed_text,
+          attrs.LinkSpeedLabel, attrs.link_speed_label, attrs.LinkSpeedText, attrs.link_speed_text,
+          attrs.PortSpeedLabel, attrs.port_speed_label,
+          attrs.Speed, attrs.speed, attrs.PortSpeed, attrs.port_speed, attrs.link_speed, attrs.LinkSpeed,
+          attrs.ifSpeed, attrs.if_speed
+        ].filter(v => v != null);
+
+        for (const raw of candidates) {
+          if (typeof raw !== "string") continue;
+          const s0 = raw.trim();
+          if (!s0) continue;
+          const s = s0.replace(/\s+/g, " ").trim();
+          const compact = s.toLowerCase().replace(/\s+/g, "");
+          const m = compact.match(/^([0-9]+(?:\.[0-9]+)?)(m|g)bps$/);
+          if (m) return `${m[1]} ${(m[2] === "g") ? "Gbps" : "Mbps"}`;
+          if (/^[0-9]+(?:\.[0-9]+)?\s*(m|g)bps$/i.test(s)) {
+            const mm = s.match(/^([0-9]+(?:\.[0-9]+)?)\s*(m|g)bps$/i);
+            return `${mm[1]} ${(mm[2].toLowerCase() === "g") ? "Gbps" : "Mbps"}`;
+          }
+        }
+        return null;
+      }
+
+      _detectedSpeedLabels(devicePrefix) {
+        const hass = this._hass;
+        const labels = new Set();
+
+        // Prefer cached per-prefix port entity_ids. We intentionally do NOT scan hass.states
+        // because iterating the full registry can lock up the browser on large installs.
+        const cached = this._portEidsByPrefix instanceof Map
+          ? (this._portEidsByPrefix.get(String(devicePrefix || "")) || null)
+          : null;
+
+        if (Array.isArray(cached) && cached.length && hass?.states) {
+          for (const eid of cached) {
+            const st = hass.states[eid];
+            if (!st) continue;
+            const label = this._speedLabelFromAttrs(st?.attributes) || null;
+            if (label) labels.add(label);
+          }
+        }
+
+        // Always include Unknown so users can set it if they want.
+        labels.add("Unknown");
+
+        // Sort numerically by Mbps
+        const toMbps = (lab) => {
+          if (lab === "Unknown") return Number.POSITIVE_INFINITY;
+          const m = String(lab).toLowerCase().match(/^([0-9]+(?:\.[0-9]+)?)\s*(m|g)bps$/);
+          if (!m) return Number.POSITIVE_INFINITY - 1;
+          const v = parseFloat(m[1]);
+          const unit = m[2];
+          return unit === "g" ? v * 1000 : v;
+        };
+        return Array.from(labels).sort((a, b) => toMbps(a) - toMbps(b));
+      }
+
+      _renderStateColorsSection(c) {
+        const palette = this._defaultStatePalette();
+        const overrides = (c.state_colors && typeof c.state_colors === "object") ? c.state_colors : {};
+        const keys = ["up_up", "up_down", "down_down", "up_not_present"];
+
+        const items = keys.map((k) => {
+          const val = (typeof overrides[k] === "string" && overrides[k].trim())
+            ? overrides[k].trim()
+            : (palette[k] || "#9ca3af");
+          return `
+            <div class="colorItem">
+              <div class="colorTitle">${this._escape(this._stateLabel(k))}</div>
+              <div class="colorControls">
+                <input class="statecolor" type="color" data-state="${this._escape(k)}" value="${this._escape(val)}" />
+                <input class="statehex" type="text" maxlength="7" data-state="${this._escape(k)}" value="${this._escape(val)}" />
+              </div>
+            </div>
+          `;
+        }).join("");
+
+        const hasOverrides = c.state_colors && typeof c.state_colors === "object" && Object.keys(c.state_colors).length > 0;
+
+        return `
+          <div class="row">
+            <div class="rowhead">
+              <label>State colors</label>
+              <button id="state_reset" class="iconbtn sm" type="button" title="Reset to defaults"${hasOverrides ? "" : " disabled"}>
+                <ha-icon icon="mdi:restore"></ha-icon>
+              </button>
+            </div>
+            <div class="hint">Customize the colors used when Color mode is set to State.</div>
+            <div class="colorGrid">${items}</div>
+          </div>
+        `;
+      }
+
+
+
+
+      _renderSpeedColorsSection(c) {
+        const palette = this._defaultSpeedPalette();
+        const overrides = (c.speed_colors && typeof c.speed_colors === "object") ? c.speed_colors : {};
+        const labels = this._detectedSpeedLabels(c.device);
+
+        const items = labels.map((lab) => {
+          const val = (typeof overrides[lab] === "string" && overrides[lab].trim())
+            ? overrides[lab].trim()
+            : (palette[lab] || palette["Unknown"]);
+          return `
+            <div class="colorItem">
+              <div class="colorTitle">${this._escape(lab)}</div>
+              <div class="colorControls">
+                <input class="speedcolor" type="color" data-speed="${this._escape(lab)}" value="${this._escape(val)}" />
+                <input class="speedhex" type="text" maxlength="7" data-speed="${this._escape(lab)}" value="${this._escape(val)}" />
+              </div>
+            </div>
+          `;
+        }).join("");
+
+        const hasOverrides = c.speed_colors && typeof c.speed_colors === "object" && Object.keys(c.speed_colors).length > 0;
+
+        return `
+          <div class="row">
+            <div class="rowhead">
+              <label>Speed colors</label>
+              <button id="speed_reset" class="iconbtn sm" type="button" title="Reset to defaults"${hasOverrides ? "" : " disabled"}>
+                <ha-icon icon="mdi:restore"></ha-icon>
+              </button>
+            </div>
+            <div class="hint">Colors are based on the switch's normalized speed labels. Only speeds detected on the selected device are shown.</div>
+            <div class="colorGrid">${items}</div>
+          </div>
+        `;
+      }
+
+
+
+      set hass(c) {
+        const palette = this._defaultSpeedPalette();
+        const overrides = (c.speed_colors && typeof c.speed_colors === "object") ? c.speed_colors : {};
+        const labels = this._detectedSpeedLabels(c.device);
+        const rows = labels.map((lab) => {
+          const val = (typeof overrides[lab] === "string" && overrides[lab].trim())
+            ? overrides[lab].trim()
+            : (palette[lab] || palette["Unknown"]);
+          return `
+            <div class="speedrow">
+              <div class="speedlabel">${this._escape(lab)}</div>
+              <input class="speedcolor" type="color" data-speed="${this._escape(lab)}" value="${this._escape(val)}" />
+              <input class="speedhex" type="text" data-speed="${this._escape(lab)}" value="${this._escape(val)}" />
+            </div>
+          `;
+        }).join("");
+
+        const hasOverrides = c.speed_colors && typeof c.speed_colors === "object" && Object.keys(c.speed_colors).length > 0;
+
+        return `
+          <div class="row">
+            <label>Speed colors</label>
+            <div class="hint">Colors are based on the switch's normalized speed labels. Only speeds detected on the selected device are shown.</div>
+            <div class="speedgrid">${rows}</div>
+            <div class="row inline">
+              <button id="speed_reset" class="btn" type="button"${hasOverrides ? "" : " disabled"}>Reset to defaults</button>
+            </div>
+          </div>
+        `;
       }
 
       set hass(hass) {
-        // Keep hass (editor API) but avoid re-rendering on every state change,
-        // which causes the <select> dropdown to collapse while the user is interacting.
+        // Keep hass (editor API) but **do not** re-render on every state change.
+        // HA updates hass very frequently; rebuilding the editor DOM causes inputs / datalist
+        // selections to disappear mid-typing (the "refresh" issue).
         const first = !this._hasHass;
         this._hass = hass;
         this._hasHass = true;
 
-        // Only load device list once per editor instance.
         if (first) {
           this._loadSnmpDevices();
         }
 
-        // Render once when we have both hass and config.
-        if (this._hasConfig && !this._rendered) {
+        if (!this._hasConfig) return;
+
+        // Only re-render when the *available ports list* changes for the selected device.
+        // This keeps the datalist current without nuking the UI on unrelated state updates.
+        const dev = (this._config?.device || "").toString();
+        const ports = dev ? (this._getPortsForDevice(dev) || []) : [];
+        const sig = dev + "::" + ports.join("|");
+        if (sig !== this._lastPortsSig) {
+          this._lastPortsSig = sig;
           this._render();
-          this._rendered = true;
         }
       }
 
       setConfig(config) {
+        config = _ssmNormalizeConfig(config);
+
         this._config = { ...config };
+
+        // Hydrate Layout positions from localStorage so they persist when the user clicks Save in the HA editor.
+        // This is critical because Layout Editor changes can happen outside the HA config dialog.
+        try {
+          const prefix = (this._config?.device || "") ? String(this._config.device) : "";
+          const bg = String(this._config?.background_image || "");
+          const key = `ssm_calib_v2:${prefix || "unknown"}:${bg}`;
+          const raw = localStorage.getItem(key);
+          if (raw) {
+            const obj = JSON.parse(raw);
+            const map = (obj && typeof obj === "object" && obj.map && typeof obj.map === "object")
+              ? obj.map
+              : (obj && typeof obj === "object" ? obj : null);
+            if (map && typeof map === "object") {
+              this._config.port_positions = map;
+            }
+          }
+        } catch (e) {}
+
+        // If the user closed the Layout Editor from the live card, reset the toggle here so it persists.
+// IMPORTANT: do NOT clear the flag until the config actually has calibration_mode=false saved,
+// otherwise "Cancel" in the HA editor would resurrect the old YAML value.
+try {
+  const prefix = (this._config?.device || "") ? String(this._config.device) : "unknown";
+  const bg = String(this._config?.background_image || "");
+  const k = `ssm_calib_force_off:${prefix}:${bg}`;
+  const ts = localStorage.getItem(k);
+
+  // If we already see calibration_mode=false coming from YAML, clear the one-shot flag.
+  if (ts && !this._config?.calibration_mode) {
+    localStorage.removeItem(k);
+  }
+
+  // If YAML still says true, force it off in the editor view (and keep the flag)
+  // so it stays off across cancel/re-open until the user saves.
+  if (ts && this._config?.calibration_mode) {
+    setTimeout(() => {
+      try { this._updateConfig("calibration_mode", false); } catch (e) {}
+    }, 0);
+  }
+} catch (e) {}
+
+        if (!this._editingTitle) {
+          this._draftTitle = null;
+        }
+
         this._hasConfig = true;
-        // Re-render when config changes (YAML/editor), but avoid frequent re-renders from hass updates.
-        this._rendered = false;
+        // Re-render when config changes so lists + preview stay in sync.
         if (this._hasHass) {
           this._render();
-          this._rendered = true;
         }
       }
 
@@ -1552,6 +3707,7 @@ async _loadSnmpDevices() {
     }
 
     const result = [];
+    const portEidsByPrefix = new Map();
     for (const d of snmpDevices) {
       const id = d.id;
       const name = d.name_by_user || d.name || id;
@@ -1573,16 +3729,20 @@ async _loadSnmpDevices() {
       // If we can't derive a prefix, skip it (prevents "empty selection" that breaks scoping).
       if (!prefix) continue;
 
-      result.push({ id, name, prefix });
+      const portEids = eids.filter(eid => String(eid).startsWith(`switch.${prefix}_`));
+      portEidsByPrefix.set(prefix, portEids);
+      result.push({ id, name, prefix, portEids });
     }
 
     result.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
     this._snmpDevices = result;
+    this._portEidsByPrefix = portEidsByPrefix;
   } catch (err) {
     // If anything fails, keep an empty list (but do not break the card/editor).
     // eslint-disable-next-line no-console
     console.warn("SNMP Switch Manager Card: failed to load devices", err);
     this._snmpDevices = [];
+    this._portEidsByPrefix = new Map();
   } finally {
     this._loadingDevices = false;
     // Re-render once after devices load; do not flip _rendered back to false.
@@ -1603,7 +3763,17 @@ _listDevicesFromHass() {
           .replace(/</g, "&lt;")
           .replace(/>/g, "&gt;")
           .replace(/\"/g, "&quot;");
-      }
+      }        // Restore focus after re-render (best-effort).
+        if (_activeId) {
+          const el = this.shadowRoot.getElementById(_activeId);
+          if (el && typeof el.focus === "function") {
+            el.focus();
+            if (_activeSel && typeof el.setSelectionRange === "function") {
+              try { el.setSelectionRange(_activeSel.start, _activeSel.end); } catch(e) {}
+            }
+          }
+        }
+
 
       _updateConfig(key, value) {
         if (!this._config) this._config = {};
@@ -1619,250 +3789,687 @@ _listDevicesFromHass() {
         // IMPORTANT: no re-render here – we keep the DOM as-is
       }
 
+      _portsForPrefix(prefix) {
+        const hass = this._hass;
+        const pfx = String(prefix || "").trim();
+        if (!hass || !pfx) return [];
+        const pre = `switch.${pfx.toLowerCase()}_`;
+        const out = [];
+        // Scan only entities matching the selected device prefix (bounded, low risk)
+        for (const [eid, st] of Object.entries(hass.states || {})) {
+          if (!eid || typeof eid !== "string") continue;
+          if (!eid.toLowerCase().startsWith(pre)) continue;
+          const a = st && st.attributes ? st.attributes : {};
+          const name = String(a.Name || "").trim();
+          if (!name) continue;
+          out.push({ name, entity_id: eid });
+        }
+        // Sort naturally by last number when possible
+        out.sort((aa, bb) => {
+          const a = aa.name, b = bb.name;
+          const ma = a.match(/(\d+)(?!.*\d)/), mb = b.match(/(\d+)(?!.*\d)/);
+          const na = ma ? parseInt(ma[1], 10) : NaN;
+          const nb = mb ? parseInt(mb[1], 10) : NaN;
+          if (Number.isFinite(na) && Number.isFinite(nb) && na !== nb) return na - nb;
+          return a.localeCompare(b);
+        });
+        return out;
+      }
+
+
+      _deviceHasBandwidthSensors(prefix) {
+        const hass = this._hass;
+        const pfx = String(prefix || "").trim();
+        if (!hass || !pfx) return false;
+
+        // Bandwidth sensors follow the per-port entity_id base:
+        //   switch.<base>  -> sensor.<base>_rx_throughput / sensor.<base>_tx_throughput
+        const ports = this._portsForPrefix(pfx) || [];
+        for (const p of ports) {
+          const eid = String(p.entity_id || "").trim();
+          if (!eid) continue;
+          const baseObj = eid.split(".")[1] || "";
+          if (!baseObj) continue;
+          const rx = `sensor.${baseObj}_rx_throughput`;
+          const tx = `sensor.${baseObj}_tx_throughput`;
+          if (hass.states?.[rx] && hass.states?.[tx]) return true;
+        }
+        return false;
+      }
+
+
+
       _render() {
         if (!this.shadowRoot) return;
-        const c = this._config || {};
+        // Preserve focused field across re-renders (prevents losing focus while editing)
+        const _active = this.shadowRoot.activeElement;
+        const _activeId = _active && _active.id ? _active.id : null;
+        const _activeSel = (_active && typeof _active.selectionStart === 'number') ? { start: _active.selectionStart, end: _active.selectionEnd } : null;
+        let c = this._config || {};
         const devices = Array.isArray(this._snmpDevices) ? this._snmpDevices : [];
         const deviceOptions = devices.map(d => {
           const sel = String(c.device || "") === String(d.prefix) ? " selected" : "";
           return `<option value="${this._escape(d.prefix)}"${sel}>${this._escape(d.name)}</option>`;
         }).join("");
 
-        const portsText = Array.isArray(c.ports)
-          ? c.ports.join("\n")
-          : (typeof c.ports === "string" ? c.ports : "");
+        const portChoices = this._portsForPrefix(String(c.device || ""));
+        const _hasBandwidth = (c.color_mode === "speed") && this._deviceHasBandwidthSensors(String(c.device || ""));
+
+        const portNameChoices = portChoices.map(p => String(p.name || "").trim()).filter(Boolean);
+        portNameChoices.sort(_ssmNaturalPortCompare);
+        // One-time migration: legacy physical rules -> virtual_overrides (inverted)
+        // This runs only when the editor has discovered the port list for the selected device.
+        try {
+          if (!this._didVirtualMigrate) {
+            const hasLegacyPref = String(c.physical_prefixes || "").trim();
+            const hasLegacyRx = String(c.physical_regex || "").trim();
+            const hasLegacy = !!(hasLegacyPref || hasLegacyRx);
+            const hasVirtualOverrides = Array.isArray(c.virtual_overrides)
+              ? c.virtual_overrides.length > 0
+              : (typeof c.virtual_overrides === "string" && c.virtual_overrides.trim());
+            if (hasLegacy && !hasVirtualOverrides && portChoices.length) {
+              const rxStr = hasLegacyRx;
+              const prefStr = hasLegacyPref;
+              const prefs = prefStr ? prefStr.split(",").map(s=>s.trim()).filter(Boolean) : [];
+              let rx = null;
+              if (rxStr) {
+                try { rx = new RegExp(rxStr, "i"); } catch(e) { rx = null; }
+              }
+              const virtualNames = [];
+              for (const p of portChoices) {
+                const n = String(p.name || "").trim();
+                const id = String(p.entity_id || "").trim();
+                if (!n && !id) continue;
+                let isPhysical = false;
+                if (rx) isPhysical = rx.test(n) || rx.test(id);
+                if (!isPhysical && !rx && prefs.length) {
+                  const nUp = n.toUpperCase();
+                  isPhysical = prefs.some(pp => nUp.startsWith(String(pp).trim().toUpperCase()));
+                }
+                // If legacy rules match physical, virtual is the inverse.
+                if (!isPhysical && n) virtualNames.push(n);
+              }
+              // De-dupe (case-insensitive) while preserving order
+              const seen = new Set();
+              const virtDedup = [];
+              for (const v of virtualNames) {
+                const k = String(v).toLowerCase();
+                if (seen.has(k)) continue;
+                seen.add(k);
+                virtDedup.push(v);
+              }
+              const newConfig = { ...this._config, virtual_overrides: virtDedup };
+              // Remove legacy keys from config so they don't keep surfacing in UI/logic
+              delete newConfig.physical_prefixes;
+              delete newConfig.physical_regex;
+              this._config = newConfig;
+              this._didVirtualMigrate = true;
+              this.dispatchEvent(new CustomEvent("config-changed", {
+                detail: { config: newConfig },
+                bubbles: true,
+                composed: true,
+              }));
+              // Continue render using migrated config
+              c = newConfig;
+            }
+          }
+        } catch(e) {}
+
+        const normLower = (arr) => {
+          const out = [];
+          const seen = new Set();
+          (arr || []).forEach(v => {
+            const s = String(v || "").trim();
+            if (!s) return;
+            const k = s.toLowerCase();
+            if (seen.has(k)) return;
+            seen.add(k);
+            out.push(s);
+          });
+          return out;
+        };
+        const _alphaSort = (arr) => (arr || []).slice().sort(_ssmNaturalPortCompare);
+        const hidePortsArr = _alphaSort(normLower(c.hide_ports));
+        const uplinkPortsArr = _alphaSort(normLower(c.uplink_ports));
+        const virtualOverridesArr = _alphaSort(normLower(c.virtual_overrides));
+
+        const portDatalistHtml = portNameChoices.length
+          ? portNameChoices.slice().sort((a,b)=>_ssmNaturalPortCompare(a,b)).map(n => `<option value="${this._escape(n)}"></option>`).join("")
+          : "";
+
+        const renderSelectList = (arr, kind) => {
+          if (!arr.length) return ``;
+    const sorted = [...arr].sort((a, b) => _ssmNaturalPortCompare(a, b));
+  // Render as HA-style selectable list rows (not chips) for consistency with current HA editors.
+  // We still use data-chip-* attrs so existing remove handlers keep working.
+  return `<div class="halist" id="${kind}_list">` + sorted.map(v =>
+    `<div class="halist-row">
+      <div class="halist-main">
+        <div class="halist-title">${this._escape(v)}</div>
+      </div>
+      <button type="button" class="halist-remove chip" data-chip-kind="${kind}" data-chip-val="${this._escape(v)}" title="Remove">×</button>
+    </div>`
+  ).join("") + `</div>`;
+};
+
+        const hidePortsHtml = `
+          ${renderSelectList(hidePortsArr, "hide_ports")}
+          <div class="chipadd">
+            <input id="hide_ports_add" class="chipinput" type="text" list="ssm_ports_datalist" placeholder="Add port…">
+            <button type="button" class="chipbtn" id="hide_ports_add_btn">Add</button>
+          </div>
+        `;
+
+        const uplinkPortsHtml = `
+          ${renderSelectList(uplinkPortsArr, "uplink_ports")}
+          <div class="chipadd">
+            <input id="uplink_ports_add" class="chipinput" type="text" list="ssm_ports_datalist" placeholder="Add uplink port…">
+            <button type="button" class="chipbtn" id="uplink_ports_add_btn">Add</button>
+          </div>
+        `;
+
+        const virtualOverridesHtml = `
+          ${renderSelectList(virtualOverridesArr, "virtual_overrides")}
+          <div class="chipadd">
+            <input id="virtual_overrides_add" class="chipinput" type="text" list="ssm_ports_datalist" placeholder="Add virtual interface…">
+            <button type="button" class="chipbtn" id="virtual_overrides_add_btn">Add</button>
+          </div>
+        `;
+
+        const stateColorsHtml = (c.color_mode === "speed") ? "" : this._renderStateColorsSection(c);
+        const speedColorsHtml = (c.color_mode === "speed") ? this._renderSpeedColorsSection(c) : "";
 
         this.shadowRoot.innerHTML = `
           <style>
-            .form {
-              display: flex;
-              flex-direction: column;
-              gap: 12px;
-              padding: 8px 4px 12px;
+            .form{display:flex;flex-direction:column;gap:12px;padding:8px 4px 12px;}
+            details.section{border:1px solid var(--divider-color);border-radius:14px;background:var(--card-background-color);overflow:hidden;}
+            details.section + details.section{margin-top:12px;}
+            details.section > summary{list-style:none;cursor:pointer;padding:12px 14px;font-size:14px;font-weight:600;display:flex;align-items:center;justify-content:space-between;}
+            details.section > summary::-webkit-details-marker{display:none;}
+details.section > summary::after{
+              content:"▾";
+              font-size:18px;
+              opacity:0.75;
+              transition: transform .18s ease;
             }
-            .row {
-              display: flex;
-              flex-direction: column;
-              gap: 4px;
+            details.section[open] > summary::after{
+              transform: rotate(180deg);
             }
-            .row.inline {
-              flex-direction: row;
-              align-items: center;
-              justify-content: space-between;
+            details.section[open] > summary{border-bottom:1px solid var(--divider-color);}
+            .secbody{padding:12px 14px;display:flex;flex-direction:column;gap:12px;}
+            .row{display:flex;flex-direction:column;gap:4px;}
+            .row.inline{flex-direction:row;align-items:center;justify-content:space-between;gap:10px;}
+            .row.two{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:end;}
+            /* Dark dropdowns (fix white background in HA dialogs) */
+            select, option {
+              color: var(--primary-text-color);
             }
-            label {
-              font-size: 13px;
-              font-weight: 500;
+            select {
+              background: var(--card-background-color);
+              border: 1px solid var(--divider-color);
+              border-radius: 10px;
+              padding: 10px 12px;
+              color-scheme: dark;
             }
-            input[type="text"],
-            input[type="number"],
-            select,
-            textarea {
-              width: 100%;
-              box-sizing: border-box;
+            option { background: var(--card-background-color); }
+            
+            .diaglist{display:flex;flex-direction:column;gap:8px;}
+            .diagitem{display:flex;align-items:center;justify-content:space-between;gap:10px;
+              padding:10px 12px;border:1px solid var(--divider-color);border-radius:12px;
+              background:rgba(0,0,0,0.10);cursor:pointer;}
+            .diagitem.disabled{opacity:0.55;}
+            .diagname{font-weight:600; overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+            .diagactions{display:flex;align-items:center;gap:8px;}
+            .btn.icon{width:34px; padding:0; text-align:center;}
+            .sub{font-size:12px; opacity:0.85;}
+
+            /* Compact color grids */
+            .colorGrid{
+              display:grid;
+              grid-template-columns: repeat(auto-fill, minmax(95px, 1fr));
+              gap:10px;
+              align-items:start;
             }
-            textarea {
-              min-height: 72px;
-              resize: vertical;
+            .colorItem{
+              display:flex;
+              flex-direction:column;
+              gap:6px;
+              padding:8px;
+              border:1px solid var(--divider-color);
+              border-radius:12px;
+              background:rgba(0,0,0,0.06);
             }
-            .two-col {
-              display: grid;
-              grid-template-columns: repeat(2, minmax(0,1fr));
-              gap: 8px;
+            .colorControls{display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:8px;}
+            .colorTitle{
+              font-size:12px;
+              font-weight:600;
+              opacity:0.95;
+              text-align:left;
+              white-space:nowrap;
+              overflow:hidden;
+              text-overflow:ellipsis;
             }
-            .hint {
-              font-size: 12px;
-              opacity: 0.8;
-            }
-          
-            .diaglist { display:flex; flex-direction:column; gap:6px; width:100%; }
-            .diagitem { display:flex; align-items:center; justify-content:space-between; border:1px solid var(--divider-color); border-radius:6px; padding:6px 8px; }
-            .diagname { font-size: 14px; }
-            .diagbtns { display:flex; gap:6px; }
-            .diagbtns button { cursor:pointer; padding:2px 8px; border:1px solid var(--divider-color); border-radius:6px; background: var(--card-background-color); color: var(--primary-text-color); }
-</style>
+            .statecolor,.speedcolor{width:34px;height:34px;padding:0;border:none;background:transparent;border-radius:8px;margin:0 auto;display:block;}
+            .statehex,.speedhex{width:100%;max-width:none;font-family:var(--code-font-family, monospace);padding:6px 8px;border-radius:10px;border:1px solid var(--divider-color);background:var(--card-background-color);color:var(--primary-text-color);text-align:center;box-sizing:border-box;}
+
+            .hint{display:none;}
+            .subhead-row{display:flex; align-items:center; justify-content:space-between; gap:10px;}
+      .rowhead{position:relative;display:flex;align-items:center;justify-content:space-between;gap:8px;}
+      .rowhead label{margin:0;}
+      .helpiconbtn{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:999px;background:transparent;border:1px solid var(--divider-color);color:var(--secondary-text-color);cursor:pointer;flex:0 0 auto;}
+      /* Nudge the icon up slightly so it visually aligns with the label baseline */
+      .rowhead .helpiconbtn{transform:translateY(-1px);}
+.helpiconbtn:hover{background:rgba(0,0,0,0.18);} 
+.helpiconbtn:active{background:rgba(0,0,0,0.26);} 
+.helpiconbtn:focus{outline:2px solid var(--primary-color);outline-offset:2px;}
+.helpiconbtn ha-icon{--mdc-icon-size:18px;}
+
+.ssm-help-popover{position:fixed; z-index:99999; max-width:340px; padding:10px 12px; border-radius:12px; border:1px solid var(--divider-color); background:var(--card-background-color); color:var(--primary-text-color); box-shadow:0 10px 30px rgba(0,0,0,.45); font-size:13px; line-height:1.35;}
+      .ssm-help-popover .close:hover{background:rgba(0,0,0,0.15);} 
+.helpline{display:flex;justify-content:flex-end;margin-top:6px;}
+            label{font-size:13px;font-weight:500;}
+            input[type="text"],input[type="number"],select,textarea{width:100%;box-sizing:border-box;padding:9px 10px;border-radius:10px;border:1px solid var(--divider-color);background:var(--card-background-color);color:var(--primary-text-color);}input[type="text"]:focus,input[type="number"]:focus,select:focus,textarea:focus{outline:2px solid var(--primary-color);outline-offset:2px;}
+            textarea{min-height:72px;resize:vertical;}
+            .inline{display:flex;gap:8px;align-items:center;}
+            .btn{padding:8px 12px;border-radius:10px;border:1px solid var(--divider-color);background:var(--card-background-color);cursor:pointer;}
+            .iconbtn{width:36px;height:36px;border-radius:10px;border:1px solid var(--divider-color);background:var(--card-background-color);cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;}
+            .iconbtn.sm{width:32px;height:32px;border-radius:10px;}
+            .iconbtn ha-icon{--mdc-icon-size:18px;}
+            .iconbtn:disabled{opacity:0.5;cursor:default;}
+
+            .btn.sm{padding:4px 10px;border-radius:10px;font-size:12px;}
+            .divider{border-top:1px solid var(--divider-color);margin:8px 0;}
+            /* searchable checklist */
+            .pickwrap{display:flex;flex-direction:column;gap:8px;}
+            .picksearch{width:100%;}
+            .picklist{border:1px solid var(--divider-color);border-radius:10px;padding:8px;max-height:220px;overflow:auto;display:flex;flex-direction:column;gap:6px;background:rgba(0,0,0,0.02);}
+            .chk{display:flex;gap:8px;align-items:center;font-size:13px;}
+
+            /* HA-style selectable lists (used for Hide ports / Uplink ports / Physical prefixes) */
+.halist{border:1px solid var(--divider-color);border-radius:14px;overflow:hidden;background:rgba(0,0,0,0.03);}
+.halist-row{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid var(--divider-color);}
+.halist-row:last-child{border-bottom:none;}
+.halist-main{flex:1;min-width:0;}
+.halist-title{font-size:14px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.halist-remove{width:34px;height:34px;border-radius:10px;border:1px solid var(--divider-color);background:rgba(0,0,0,0.02);color:var(--primary-text-color);cursor:pointer;font-size:18px;line-height:1;display:flex;align-items:center;justify-content:center;}
+.halist-remove:hover{background:rgba(0,0,0,0.06);}
+
+/* add row under lists */
+.chipadd{margin-top:10px;display:flex;gap:10px;align-items:center;}
+.chipinput{flex:1;min-width:0;padding:9px 10px;border-radius:10px;border:1px solid var(--divider-color);background:rgba(0,0,0,0.02);color:var(--primary-text-color);}
+.chipbtn{padding:9px 12px;border-radius:10px;border:1px solid var(--divider-color);background:rgba(0,0,0,0.02);color:var(--primary-text-color);cursor:pointer;}
+.chipbtn:hover{background:rgba(0,0,0,0.06);}
+            .chip .x{font-size:14px;line-height:1;opacity:.75;margin-left:2px;}
+            .chipadd{display:flex;gap:8px;align-items:center;margin-top:8px;}
+            .chipinput{flex:1;min-width:120px;}
+            .chipbtn{border:1px solid var(--divider-color);border-radius:10px;padding:6px 10px;background:var(--card-background-color);cursor:pointer;}
+            .chipbtn:hover{background:rgba(0,0,0,0.04);}
+            .diaglist{display:flex;flex-direction:column;gap:6px;width:100%;}
+            .diagitem{display:flex;align-items:center;justify-content:space-between;border:1px solid var(--divider-color);border-radius:10px;padding:6px 8px;}
+            .diagbtns{display:flex;gap:6px;}
+            .diagbtns button{cursor:pointer;padding:2px 8px;border:1px solid var(--divider-color);border-radius:10px;background:var(--card-background-color);color:var(--primary-text-color);}
+          </style>
+
           <div class="form">
-            <div class="row">
-              <label for="title">Title</label>
-              <input id="title" type="text" value="${this._escape(c.title || "")}">
-            </div>
 
-            <div class="two-col">
-              <div class="row">
-                <label for="view">View</label>
-                <select id="view">
-                  <option value="panel"${c.view === "panel" ? " selected" : ""}>Panel</option>
-                  <option value="list"${c.view === "list" ? " selected" : ""}>List</option>
-                </select>
+            <datalist id="ssm_ports_datalist">
+              ${portDatalistHtml}
+            </datalist>
+
+            <details class="section" open>
+              <summary>Switch</summary>
+              <div class="secbody">
+                <div class="row">
+                  <label for="title">Title</label>
+                  <input id="title" type="text" value="${this._escape(((this._draftTitle ?? c.title) || ""))}">
+                </div>
+
+                <div class="row">
+                  <label for="device">Switch device</label>
+                  <select id="device">
+                    <option value="">Select a device…</option>
+                    ${deviceOptions}
+                  </select>
+                  <div class="hint">Select a SNMP Switch Manager device (derived from entity ID prefixes).</div>
+                </div>
               </div>
-              <div class="row">
-                <label for="info_position">Info position</label>
-                <select id="info_position">
-                  <option value="above"${c.info_position !== "below" ? " selected" : ""}>Above ports</option>
-                  <option value="below"${c.info_position === "below" ? " selected" : ""}>Below ports</option>
-                </select>
-              </div>
-            </div>
+            </details>
 
-            <div class="row">
-              <label for="color_mode">Port colors</label>
-              <select id="color_mode">
-                <option value="state"${(c.color_mode !== "speed") ? " selected" : ""}>State (Admin/Oper)</option>
-                <option value="speed"${(c.color_mode === "speed") ? " selected" : ""}>Speed</option>
-              </select>
-              <div class="hint">Choose whether port colors represent port state or link speed.</div>
-            </div>
+            <details class="section" open>
+              <summary>Layout</summary>
+              <div class="secbody">
+                <div class="row two">
+                  <div class="row">
+                    <label for="view">View</label>
+                    <select id="view">
+                      <option value="panel"${c.view === "panel" ? " selected" : ""}>Panel</option>
+                      <option value="list"${c.view === "list" ? " selected" : ""}>List</option>
+                    </select>
+                  </div>
+                  <div class="row">
+                    <label for="info_position">Info position</label>
+                    <select id="info_position">
+                      <option value="above"${c.info_position !== "below" ? " selected" : ""}>Above ports</option>
+                      <option value="below"${c.info_position === "below" ? " selected" : ""}>Below ports</option>
+                    </select>
+                  </div>
 
+                </div>${c.view === "panel" ? `
 
+                <div class="row">
+                  <label for="background_image">Panel background image (optional)</label>
+                  <input id="background_image" type="text" placeholder="/local/your_switch.png" value="${c.background_image != null ? this._escape(c.background_image) : ""}">
+                  <div class="hint">Only used in Panel view.</div>
+                ` : ""}
+</div>${c.view === "panel" ? `
+
+                <div class="row inline">
+                  <label for="calibration_mode">Layout Editor</label><div class="helpiconbtn" data-help-title="Layout Editor" data-help="layout_editor"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div>
+                  <ha-switch id="calibration_mode" ${c.calibration_mode ? " checked" : ""}${c.view === "list" ? " disabled" : ""}></ha-switch>
+                </div>
+                ` : ""}
+<div class="row two">${c.view === "panel" ? `
+                  <div class="row">
+                    <div class="rowhead"><label for="ports_per_row">Ports per row</label><div class="helpiconbtn" data-help-title="Ports per row" data-help="ports_per_row"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
+                    <input id="ports_per_row" type="number" min="1" value="${(this._editingFields?.has('ports_per_row') && this._draftValues?.ports_per_row != null) ? this._draftValues.ports_per_row : (c.ports_per_row != null ? Number(c.ports_per_row) : 24)}"${c.view === "list" ? " disabled" : ""}>
+                  </div>
+                  ` : ""}${c.view === "panel" ? `
 <div class="row">
-  <label for="device">Switch device</label>
-  <select id="device">
-    <option value="">Select a device…</option>
-    ${deviceOptions}
-  </select>
-  <div class="hint">Select a SNMP Switch Manager device (derived from entity ID prefixes).</div>
+                    <div class="rowhead"><label for="panel_width">Panel width</label><div class="helpiconbtn" data-help-title="Panel width" data-help="panel_width"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
+                    <input id="panel_width" type="number" min="200" value="${(this._editingFields?.has('panel_width') && this._draftValues?.panel_width != null) ? this._draftValues.panel_width : (c.panel_width != null ? Number(c.panel_width) : 740)}"${c.view === "list" ? " disabled" : ""}>
+                  </div>
+                ` : ""}
 </div>
 
-<div class="two-col">
-  <div class="row">
-    <label for="physical_prefixes">Physical interface prefixes (comma-separated)</label>
-    <input id="physical_prefixes" type="text" placeholder="Gi,Te,Tw,Fa,Ge,Eth,Po,Port,SLOT" value="${c.physical_prefixes != null ? this._escape(String(c.physical_prefixes)) : ""}">
-    <div class="hint">Interfaces whose <b>Name</b> starts with any prefix are treated as <b>Physical</b>. All others are treated as <b>Virtual</b>.</div>
-  </div>
-  <div class="row">
-    <label for="physical_regex">Physical interface regex (optional override)</label>
-    <input id="physical_regex" type="text" placeholder="^(Gi|Te|Tw|Fa|Ge|Eth|Po|Port|SLOT)" value="${c.physical_regex != null ? this._escape(String(c.physical_regex)) : ""}">
-    <div class="hint">If set, this regex (case-insensitive) determines which interfaces are <b>Physical</b>. Prefix list is ignored when regex is provided.</div>
-  </div>
+                <div class="row two">${c.view === "panel" ? `
+                  <div class="row">
+                    <div class="rowhead"><label for="port_scale">Port scale</label><div class="helpiconbtn" data-help-title="Port scale" data-help="port_scale"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
+                    <input id="port_scale" type="number" step="0.05" min="0.1" value="${c.port_scale != null ? Number(c.port_scale) : 1}"${c.view === "list" ? " disabled" : ""}>
+                  </div>
+                  ` : ""}${c.view === "panel" ? `
+<div class="row">
+                    <div class="rowhead"><label for="gap">Port gap</label><div class="helpiconbtn" data-help-title="Port gap" data-help="port_gap"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
+                    <input id="gap" type="number" min="0" value="${(this._editingFields?.has('gap') && this._draftValues?.gap != null) ? this._draftValues.gap : (c.gap != null ? Number(c.gap) : 10)}"${c.view === "list" ? " disabled" : ""}>
+                  </div>
+                ` : ""}
 </div>
 
-            </div>
-            <div class="two-col">
-              <div class="row">
-                <label for="ports_per_row">Ports per row (panel)</label>
-                <input id="ports_per_row" type="number" min="1" value="${c.ports_per_row != null ? Number(c.ports_per_row) : 24}">
               </div>
-              <div class="row">
-                <label for="panel_width">Panel width</label>
-                <input id="panel_width" type="number" min="200" value="${c.panel_width != null ? Number(c.panel_width) : 740}">
+            </details>
+
+            <details class="section" open>
+              <summary>Appearance</summary>
+              <div class="secbody">
+
+                <div class="row">
+                  <label for="color_mode">Port colors</label>
+                  <select id="color_mode">
+                    <option value="state"${(c.color_mode !== "speed") ? " selected" : ""}>State (Admin/Oper)</option>
+                    <option value="speed"${(c.color_mode === "speed") ? " selected" : ""}>Speed</option>
+                  </select>
+                  <div class="hint">Choose whether port colors represent port state or link speed.</div>
+                  ${stateColorsHtml}${speedColorsHtml}
+                </div>${_hasBandwidth ? `
+
+                <div class="row inline">
+                  <div class="rowhead">
+                    <label for="speed_click_opens_graph">Open traffic graph on port click</label>
+                    <div class="helpiconbtn" icon="mdi:help-circle-outline" data-help-title="Open traffic graph on port click" data-help="speed_click_opens_graph"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div>
+                  </div>
+                  <ha-switch id="speed_click_opens_graph" ${c.speed_click_opens_graph ? " checked" : ""}></ha-switch>
+                </div>
+
+                ` : ""}${c.view === "panel" ? `
+
+                <div class="row inline">
+                  <label for="show_labels">Show labels under ports</label>
+                  <ha-switch id="show_labels" ${c.show_labels !== false ? " checked" : ""}${c.view === "list" ? " disabled" : ""}></ha-switch>
+                </div>
+
+                ` : ""}${c.view === "panel" ? `
+<div class="row inline">
+                  <label for="label_numbers_only">Labels: numbers only</label>
+                  <ha-switch id="label_numbers_only" ${c.label_numbers_only ? " checked" : ""}${c.show_labels === false || c.view === "list" ? " disabled" : ""}></ha-switch>
+                </div>
+
+                ` : ""}${c.view === "panel" ? `
+<div class="row">
+                  <label for="label_size">Label font size</label>
+                  <input id="label_size" type="number" min="1" value="${c.label_size != null ? Number(c.label_size) : 8}"${c.view === "list" ? " disabled" : ""}>
+                </div>
+
+                
+                ` : ""}${c.view === "panel" ? `
+<div class="row two">
+                  <div class="row">
+                    <label for="label_color">Label font color</label>
+                    <div class="inline">
+                      <input id="label_color" type="color" value="${c.label_color != null ? String(c.label_color) : "#ffffff"}">
+                      <button class="btn sm" id="label_color_clear" type="button" title="Use default label color">Clear</button>
+                    </div>
+                    <div class="hint">Clear restores the default theme color.</div>
+                  </div>
+
+                  ` : ""}
+${c.view === "panel" ? `
+<div class="row">
+                    <label for="label_bg_color">Label background color</label>
+                    <div class="inline">
+                      <input id="label_bg_color" type="color" value="${c.label_bg_color != null ? String(c.label_bg_color) : "#000000"}">
+                      <button class="btn sm" id="label_bg_color_clear" type="button" title="Use default label background color">Clear</button>
+                    </div>
+
+` : ""}                    <div class="hint">Clear restores the default background.</div>
+                  </div>
+                </div>
+
+
               </div>
-            </div>
-
-            <div class="two-col">
-              <div class="row">
-                <label for="port_size">Port size</label>
-                <input id="port_size" type="number" min="8" value="${c.port_size != null ? Number(c.port_size) : 18}">
-              </div>
-              <div class="row">
-                <label for="gap">Port gap</label>
-                <input id="gap" type="number" min="0" value="${c.gap != null ? Number(c.gap) : 10}">
-              </div>
-            </div>
-
-            <div class="row inline">
-              <label for="show_labels">Show labels under ports</label>
-              <input id="show_labels" type="checkbox"${c.show_labels !== false ? " checked" : ""}>
-            </div>
-
-            <div class="row inline">
-              <label for="hide_diagnostics">Hide Diagnostics panel</label>
-              <input id="hide_diagnostics" type="checkbox"${c.hide_diagnostics ? " checked" : ""}>
-            </div>
-
-            <div class="row inline">
-              <label for="hide_virtual_interfaces">Hide Virtual Interfaces panel</label>
-              <input id="hide_virtual_interfaces" type="checkbox"${c.hide_virtual_interfaces ? " checked" : ""}>
-            </div>
+            </details>
 
             
-            <div class="row">
-              <label for="background_image">Panel background image (optional)</label>
-              <input id="background_image" type="text" placeholder="/local/your_switch.png" value="${c.background_image != null ? this._escape(c.background_image) : ""}">
-            </div>
+            <details class="section" open>
+              <summary>Content</summary>
+              <div class="secbody">
 
-            <div class="row two">
-              <div>
-                <label for="ports_offset_x">Ports offset X (px)</label>
-                <input id="ports_offset_x" type="number" value="${c.ports_offset_x != null ? Number(c.ports_offset_x) : 0}">
-              </div>
-              <div>
-                <label for="ports_offset_y">Ports offset Y (px)</label>
-                <input id="ports_offset_y" type="number" value="${c.ports_offset_y != null ? Number(c.ports_offset_y) : 0}">
-              </div>
-            </div>
+                <div class="row inline">
+                  <label for="show_diagnostics">Show Diagnostics</label><div class="helpiconbtn" icon="mdi:help-circle-outline" data-help-title="Show Diagnostics" data-help="show_diagnostics"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div>
+                  <ha-switch id="show_diagnostics" ${c.hide_diagnostics ? "" : " checked"}></ha-switch>
+                </div>
 
-            <div class="row">
-              <label for="ports_scale">Ports scale</label>
-              <input id="ports_scale" type="number" step="0.05" min="0.1" value="${c.ports_scale != null ? Number(c.ports_scale) : 1}">
-            </div>
-
-            <div class="row">
-              <label for="port_positions">Port positions (optional JSON map)</label>
-              <textarea id="port_positions" rows="6" placeholder='{"Gi1/0/1":{"x":20,"y":40}}'>${c.port_positions ? this._escape(JSON.stringify(c.port_positions)) : ""}</textarea>
-              <div class="hint">Keys are interface Names; values are SVG x/y coords. Leave blank to use the grid layout.</div>
-            </div>
-
-            <div class="row inline">
-              <label for="calibration_mode">Calibration mode (click-to-generate Port positions JSON)</label>
-              <input id="calibration_mode" type="checkbox"${c.calibration_mode ? " checked" : ""}>
-            </div>
-
-<div class="row">
-              <label for="label_size">Label font size</label>
-              <input id="label_size" type="number" min="6" value="${c.label_size != null ? Number(c.label_size) : 8}">
-            </div>
-
-            <div class="row">
-              <label for="ports">Explicit ports (optional)</label>
-              <textarea
-                id="ports"
-                placeholder="switch.gi1_0_1\nswitch.gi1_0_2"
-              >${this._escape(portsText)}</textarea>
-              <div class="hint">One entity ID per line. If set, only these switch entities will be shown (auto-discovery is skipped).</div>
-            </div>
-
-            <div class="row">
-              <label>Diagnostics order</label>
-              <div class="diaglist">
-                ${(["hostname","manufacturer","model","firmware_revision","uptime"]).map((k, i) => {
-                  const order = Array.isArray(c.diagnostics_order) && c.diagnostics_order.length
-                    ? c.diagnostics_order
-                    : ["hostname","manufacturer","model","firmware_revision","uptime"];
-                  const key = order[i] || k;
-                  const label = ({
-                    hostname: "Hostname",
-                    manufacturer: "Manufacturer",
-                    model: "Model",
-                    firmware_revision: "Firmware Revision",
-                    uptime: "Uptime"
-                  })[key] || key;
-                  return `
-                    <div class="diagitem">
-                      <span class="diagname">${this._escape(label)}</span>
-                      <div class="diagbtns">
-                        <button class="diagup" data-idx="${i}" title="Move up">▲</button>
-                        <button class="diagdown" data-idx="${i}" title="Move down">▼</button>
-                      </div>
+                ${c.hide_diagnostics ? "" : `
+                  <div class="row">
+                    <div class="rowhead"><label>Diagnostics order</label><div class="helpiconbtn" icon="mdi:help-circle-outline" data-help-title="Diagnostics order" data-help="diagnostics_order"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
+                    <div class="diaglist">
+                      ${(() => {
+                        const order = Array.isArray(c.diagnostics_order) && c.diagnostics_order.length
+                          ? c.diagnostics_order
+                          : ["hostname","manufacturer","model","firmware_revision","uptime"];
+                        const enabledMap = (c.diagnostics_enabled && typeof c.diagnostics_enabled === "object") ? c.diagnostics_enabled : {};
+                        return order.map((key, idx) => {
+                          const enabled = enabledMap[key] !== false;
+                          const label = this._diagnosticLabel(key);
+                          const isCustom = key.includes(".");
+                          return `
+                            <div class="diagitem ${enabled ? "" : "disabled"}" data-diag="${this._escape(key)}">
+                              <div class="diagname" title="${this._escape(label)}">${this._escape(label)}</div>
+                              <div class="diagactions">
+                                <button class="btn icon sm diag-up" data-diag="${this._escape(key)}" title="Move up" ${idx===0?'disabled':''}>▲</button>
+                                <button class="btn icon sm diag-down" data-diag="${this._escape(key)}" title="Move down" ${idx===order.length-1?'disabled':''}>▼</button>
+                                ${isCustom ? `<button class="btn icon sm diag-remove" data-diag="${this._escape(key)}" title="Remove">✕</button>` : ``}
+                              </div>
+                            </div>
+                          `;
+                        }).join("");
+                      })()}
                     </div>
-                  `;
-                }).join("")}
+
+                    <div class="row">
+                      <label for="diag_add_input" class="sub">Add diagnostic sensor</label>
+                      <div class="inline">
+                        <input id="diag_add_input" type="text" placeholder="sensor.some_sensor" list="diag_sensors">
+                        <button class="btn sm" id="diag_add_btn" type="button">Add</button>
+                      </div>
+                      <datalist id="diag_sensors">
+                        ${this._hass ? Object.keys(this._hass.states).filter(e=>e.startsWith("sensor.")).map(e=>`<option value="${e}"></option>`).join("") : ""}
+                      </datalist>
+                      <div class="hint">Click a row to enable/disable. Built-in items can be reordered; custom sensors can also be removed.</div>
+                    </div>
+                  </div>
+                `}
+
+                <div class="row inline">
+                  <label for="show_virtual_interfaces">Show Virtual Interfaces</label><div class="helpiconbtn" icon="mdi:help-circle-outline" data-help-title="Show Virtual Interfaces" data-help="show_virtual"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div>
+                  <ha-switch id="show_virtual_interfaces" ${c.hide_virtual_interfaces ? "" : " checked"}></ha-switch>
+                </div>
+
+                ${c.hide_virtual_interfaces ? "" : `
+                  <div class="row">
+                    <div class="rowhead"><label>Virtual interfaces (override)</label><div class="helpiconbtn" icon="mdi:help-circle-outline" data-help-title="Virtual interfaces (override)" data-help="virtual_overrides"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
+                  </div>
+
+                  ${virtualOverridesHtml}
+                `}
+
+                <div class="divider"></div>
+
+                <div class="row inline">
+                  <label for="show_uplinks_separately">Show uplinks separately in layout</label><div class="helpiconbtn" icon="mdi:help-circle-outline" data-help-title="Show uplinks separately in layout" data-help="show_uplinks_separately"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div>
+                  <ha-switch id="show_uplinks_separately" ${c.show_uplinks_separately ? " checked" : ""}></ha-switch>
+                </div>
+
+                ${c.show_uplinks_separately ? `
+                  <div class="row">
+                    <div class="rowhead"><label>Uplink ports</label><div class="helpiconbtn" icon="mdi:help-circle-outline" data-help-title="Uplink ports" data-help="uplink_ports"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
+                    ${uplinkPortsHtml}
+                  </div>
+                ` : ""}
+
+                <div class="divider"></div>
+<div class="divider"></div>
+
+                <div class="row">
+                  <div class="rowhead"><label>Hide ports</label><div class="helpiconbtn" icon="mdi:help-circle-outline" data-help-title="Hide ports" data-help="hide_ports"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
+                          ${hidePortsHtml}
+                </div>
+
               </div>
-              <div class="hint">Diagnostics sensors are discovered automatically for the selected device (Hostname, Manufacturer, Model, Firmware Revision, Uptime). Use the arrows to reorder.</div>
-            </div>
+            </details>
+
           </div>
         `;
 
         const root = this.shadowRoot;
 
-        // Title
-        root.getElementById("title")?.addEventListener("input", (ev) => {
-          this._updateConfig("title", ev.target.value);
+        // Ensure HA icons render inside the editor
+        root.querySelectorAll("ha-icon").forEach((el) => { try { el.hass = this._hass; } catch (e) {} });
+
+        // Title (use draft value to prevent re-render on every keystroke)
+        const titleEl = root.getElementById("title");
+        titleEl?.addEventListener("focus", () => {
+          this._editingTitle = true;
+          // Initialize draft from current config once the user starts editing.
+          if (this._draftTitle === null || this._draftTitle === undefined) {
+            this._draftTitle = this._config?.title ?? "";
+          }
         });
+        titleEl?.addEventListener("input", (ev) => {
+          this._draftTitle = ev.target.value;
+        });
+        const commitTitle = () => {
+          const next = (this._draftTitle ?? "").toString();
+          const cur = (this._config?.title ?? "").toString();
+          this._editingTitle = false;
+          if (next !== cur) this._updateConfig("title", next);
+          // Keep draft in sync with committed value.
+          this._draftTitle = null;
+        };
+        titleEl?.addEventListener("blur", commitTitle);
+        titleEl?.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") {
+            ev.preventDefault();
+            titleEl.blur();
+          }
+          if (ev.key === "Escape") {
+            // Revert draft and stop editing.
+            this._draftTitle = null;
+            this._editingTitle = false;
+            this._rendered = false;
+            this._render();
+          }
+        });
+
+// Switch device
+root.getElementById("device")?.addEventListener("change", (ev) => {
+  const next = (ev.target.value || "").toString();
+  this._updateConfig("device", next);
+  // Force port list + datalist to refresh for the new device.
+  this._lastPortsSig = "";
+  this._render();
+});
 
         // View
         root.getElementById("view")?.addEventListener("change", (ev) => {
           this._updateConfig("view", ev.target.value || "panel");
         });
+
+        // Panel layout basics (only relevant in panel view)
+        root.getElementById("ports_per_row")?.addEventListener("change", (ev) => {
+          const v = parseInt(ev.target.value, 10);
+          this._updateConfig("ports_per_row", (Number.isFinite(v) && v > 0) ? v : 24);
+        });
+        root.getElementById("panel_width")?.addEventListener("change", (ev) => {
+          const v = parseInt(ev.target.value, 10);
+          this._updateConfig("panel_width", (Number.isFinite(v) && v > 0) ? v : 740);
+        });
+        root.getElementById("gap")?.addEventListener("change", (ev) => {
+          const v = parseFloat(ev.target.value);
+          this._updateConfig("gap", (Number.isFinite(v) && v >= 0) ? v : 10);
+        });
+        // Drafted number inputs (avoid HA editor re-renders clobbering typing)
+        const bindDraftNumber = (id, key, fallback, parseFn) => {
+          const el = root.getElementById(id);
+          if (!el) return;
+          let committed = false;
+
+          const commit = () => {
+            if (committed) return;
+            committed = true;
+            this._editingFields?.delete(key);
+            const raw = (this._draftValues && this._draftValues[key] != null) ? this._draftValues[key] : el.value;
+            try { if (this._draftValues) delete this._draftValues[key]; } catch (e) {}
+            const parsed = (parseFn ? parseFn(raw) : parseInt(raw, 10));
+            const v = Number.isFinite(parsed) ? parsed : fallback;
+            this._updateConfig(key, v);
+            // allow next edit cycle
+            setTimeout(() => { committed = false; }, 0);
+          };
+
+          el.addEventListener("focus", () => {
+            this._editingFields?.add(key);
+            if (this._draftValues && this._draftValues[key] == null) this._draftValues[key] = String(el.value ?? "");
+          });
+          el.addEventListener("input", () => {
+            if (this._draftValues) this._draftValues[key] = String(el.value ?? "");
+          });
+          el.addEventListener("blur", commit);
+          el.addEventListener("change", commit);
+        };
+
+        bindDraftNumber("ports_per_row", "ports_per_row", 24, (raw) => {
+          const n = parseInt(String(raw ?? "").trim(), 10);
+          return Number.isFinite(n) && n >= 1 ? n : 24;
+        });
+        bindDraftNumber("panel_width", "panel_width", 740, (raw) => {
+          const n = parseInt(String(raw ?? "").trim(), 10);
+          return Number.isFinite(n) && n >= 200 ? n : 740;
+        });
+        bindDraftNumber("gap", "gap", 10, (raw) => {
+          const n = parseInt(String(raw ?? "").trim(), 10);
+          return Number.isFinite(n) && n >= 0 ? n : 10;
+        });
+
+
 
         // Info position
         root.getElementById("info_position")?.addEventListener("change", (ev) => {
@@ -1878,60 +4485,129 @@ _listDevicesFromHass() {
           this._updateConfig("color_mode", v === "speed" ? "speed" : "state");
         });
 
-
-// Switch device
-root.getElementById("device")?.addEventListener("change", (ev) => {
-  const val = String(ev.target.value || "").trim();
-  this._updateConfig("device", val || null);
-});
-
-        // Physical interface classification (panel/list)
-        // Use "change" (commit-on-blur/enter) instead of "input" to avoid the HA
-        // visual editor re-rendering on every keystroke (which causes focus loss).
-        root.getElementById("physical_prefixes")?.addEventListener("change", (ev) => {
-          const val = String(ev.target.value || "");
-          this._updateConfig("physical_prefixes", val.trim() ? val : null);
-        });
-        root.getElementById("physical_regex")?.addEventListener("change", (ev) => {
-          const val = String(ev.target.value || "");
-          this._updateConfig("physical_regex", val.trim() ? val : null);
+        root.getElementById("speed_click_opens_graph")?.addEventListener("change", (ev) => {
+          this._updateConfig("speed_click_opens_graph", !!ev.target.checked);
         });
 
-        // Ports per row
-        root.getElementById("ports_per_row")?.addEventListener("change", (ev) => {
-          const v = parseInt(ev.target.value, 10);
-          this._updateConfig("ports_per_row", Number.isFinite(v) ? v : 24);
+        // Reset buttons (icon buttons in section headers)
+        root.getElementById("speed_reset")?.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          this._updateConfig("speed_colors", null);
+          this._rendered = false;
+          this._render();
+        });
+        root.getElementById("state_reset")?.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          this._updateConfig("state_colors", null);
+          this._rendered = false;
+          this._render();
         });
 
-        // Panel width
-        root.getElementById("panel_width")?.addEventListener("change", (ev) => {
-          const v = parseInt(ev.target.value, 10);
-          this._updateConfig("panel_width", Number.isFinite(v) ? v : 740);
+        const speedPalette = this._defaultSpeedPalette();
+        const statePalette = this._defaultStatePalette();
+
+        const updateSpeedColor = (label, color) => {
+          const lab = String(label || "").trim() || "Unknown";
+          const cval = String(color || "").trim();
+          if (!/^#[0-9a-fA-F]{6}$/.test(cval)) return;
+
+          const cur = (this._config?.speed_colors && typeof this._config.speed_colors === "object")
+            ? { ...this._config.speed_colors }
+            : {};
+          const def = speedPalette[lab] || speedPalette["Unknown"];
+          if (cval.toLowerCase() === String(def).toLowerCase()) delete cur[lab];
+          else cur[lab] = cval;
+
+          this._updateConfig("speed_colors", Object.keys(cur).length ? cur : null);
+        };
+
+        const updateStateColor = (key, color) => {
+          const k = String(key || "").trim();
+          const cval = String(color || "").trim();
+          if (!/^#[0-9a-fA-F]{6}$/.test(cval)) return;
+
+          const cur = (this._config?.state_colors && typeof this._config.state_colors === "object")
+            ? { ...this._config.state_colors }
+            : {};
+          const def = statePalette[k] || "#9ca3af";
+          if (cval.toLowerCase() === String(def).toLowerCase()) delete cur[k];
+          else cur[k] = cval;
+
+          this._updateConfig("state_colors", Object.keys(cur).length ? cur : null);
+        };
+
+        // Live sync: picker -> hex (no config write), commit on change
+        root.querySelectorAll("input.speedcolor").forEach((inp) => {
+          inp.addEventListener("input", () => {
+            const lab = inp.dataset.speed || "Unknown";
+            const hex = root.querySelector(`input.speedhex[data-speed="${lab}"]`);
+            if (hex) hex.value = inp.value;
+          });
+          inp.addEventListener("change", () => {
+            const lab = inp.dataset.speed || "Unknown";
+            updateSpeedColor(lab, inp.value);
+          });
         });
 
-        // Port size
-        root.getElementById("port_size")?.addEventListener("change", (ev) => {
-          const v = parseInt(ev.target.value, 10);
-          this._updateConfig("port_size", Number.isFinite(v) ? v : 18);
+        root.querySelectorAll("input.statecolor").forEach((inp) => {
+          inp.addEventListener("input", () => {
+            const lab = inp.dataset.state || "up_up";
+            const hex = root.querySelector(`input.statehex[data-state="${lab}"]`);
+            if (hex) hex.value = inp.value;
+          });
+          inp.addEventListener("change", () => {
+            const lab = inp.dataset.state || "up_up";
+            updateStateColor(lab, inp.value);
+          });
         });
 
-        // Gap
-        root.getElementById("gap")?.addEventListener("change", (ev) => {
-          const v = parseInt(ev.target.value, 10);
-          this._updateConfig("gap", Number.isFinite(v) ? v : 10);
+        // Commit hex edits on change (avoid rerender while typing)
+        root.querySelectorAll("input.speedhex").forEach((inp) => {
+          inp.addEventListener("change", () => {
+            const lab = inp.dataset.speed || "Unknown";
+            let v = String(inp.value || "").trim();
+            if (!v) return;
+            if (!v.startsWith("#")) v = `#${v}`;
+            if (!/^#[0-9a-fA-F]{6}$/.test(v)) return;
+            const color = root.querySelector(`input.speedcolor[data-speed="${lab}"]`);
+            if (color) color.value = v;
+            updateSpeedColor(lab, v);
+          });
         });
 
-        // Show labels
-        root.getElementById("show_labels")?.addEventListener("change", (ev) => {
-          this._updateConfig("show_labels", !!ev.target.checked);
+        root.querySelectorAll("input.statehex").forEach((inp) => {
+          inp.addEventListener("change", () => {
+            const lab = inp.dataset.state || "up_up";
+            let v = String(inp.value || "").trim();
+            if (!v) return;
+            if (!v.startsWith("#")) v = `#${v}`;
+            if (!/^#[0-9a-fA-F]{6}$/.test(v)) return;
+            const color = root.querySelector(`input.statecolor[data-state="${lab}"]`);
+            if (color) color.value = v;
+            updateStateColor(lab, v);
+          });
         });
 
-        // Hide panels
-        root.getElementById("hide_diagnostics")?.addEventListener("change", (ev) => {
-          this._updateConfig("hide_diagnostics", !!ev.target.checked);
+        // Hide ports checklist
+        root.querySelectorAll("input[data-hide-port]")?.forEach((el) => {
+          el.addEventListener("change", () => {
+            const selected = Array.from(root.querySelectorAll("input[data-hide-port]"))
+              .filter(x => x.checked)
+              .map(x => String(x.getAttribute("data-hide-port") || "").trim())
+              .filter(Boolean);
+            this._updateConfig("hide_ports", selected);
+          });
         });
-        root.getElementById("hide_virtual_interfaces")?.addEventListener("change", (ev) => {
-          this._updateConfig("hide_virtual_interfaces", !!ev.target.checked);
+
+        // Uplink ports checklist
+        root.querySelectorAll("input[data-uplink-port]")?.forEach((el) => {
+          el.addEventListener("change", () => {
+            const selected = Array.from(root.querySelectorAll("input[data-uplink-port]"))
+              .filter(x => x.checked)
+              .map(x => String(x.getAttribute("data-uplink-port") || "").trim())
+              .filter(Boolean);
+            this._updateConfig("uplink_ports", selected);
+          });
         });
 
         
@@ -1948,9 +4624,9 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
           const v = parseFloat(ev.target.value);
           this._updateConfig("ports_offset_y", Number.isFinite(v) ? v : 0);
         });
-        root.getElementById("ports_scale")?.addEventListener("change", (ev) => {
+        root.getElementById("port_scale")?.addEventListener("change", (ev) => {
           const v = parseFloat(ev.target.value);
-          this._updateConfig("ports_scale", (Number.isFinite(v) && v > 0) ? v : 1);
+          this._updateConfig("port_scale", (Number.isFinite(v) && v > 0) ? v : 1);
         });
         root.getElementById("port_positions")?.addEventListener("change", (ev) => {
           const raw = String(ev.target.value || "").trim();
@@ -1968,20 +4644,62 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
           this._updateConfig("calibration_mode", !!ev.target.checked);
         });
 
+
+        // Content toggles
+        // UI uses "Show …" switches, but config stores the inverse for diagnostics/virtual.
+        root.getElementById("show_diagnostics")?.addEventListener("change", (ev) => {
+          // checked = show
+          this._updateConfig("hide_diagnostics", !ev.target.checked);
+          this._render();
+        });
+
+        root.getElementById("show_virtual_interfaces")?.addEventListener("change", (ev) => {
+          this._updateConfig("hide_virtual_interfaces", !ev.target.checked);
+          this._render();
+        });
+
+        root.getElementById("show_uplinks_separately")?.addEventListener("change", (ev) => {
+          this._updateConfig("show_uplinks_separately", !!ev.target.checked);
+          this._render();
+        });
+
+
+        // Labels under ports (Panel view)
+        root.getElementById("show_labels")?.addEventListener("change", (ev) => {
+          this._updateConfig("show_labels", !!ev.target.checked);
+        });
+
+        root.getElementById("label_numbers_only")?.addEventListener("change", (ev) => {
+          this._updateConfig("label_numbers_only", !!ev.target.checked);
+        });
+
 // Label size
         root.getElementById("label_size")?.addEventListener("change", (ev) => {
           const v = parseInt(ev.target.value, 10);
           this._updateConfig("label_size", Number.isFinite(v) ? v : 8);
         });
 
-        // Explicit ports textarea
-        root.getElementById("ports")?.addEventListener("input", (ev) => {
-          const text = ev.target.value || "";
-          const list = text
-            .split(/\r?\n/)
-            .map((ln) => ln.trim())
-            .filter((ln) => ln.length > 0);
-          this._updateConfig("ports", list.length ? list : null);
+        // Label color
+        root.getElementById("label_color")?.addEventListener("change", (ev) => {
+          const v = String(ev.target.value || "").trim();
+          this._updateConfig("label_color", v || null);
+        });
+
+        root.getElementById("label_color_clear")?.addEventListener("click", () => {
+          this._updateConfig("label_color", null);
+          const inp = root.getElementById("label_color");
+          if (inp) inp.value = "#ffffff";
+        });
+
+        // Label background color
+        root.getElementById("label_bg_color")?.addEventListener("change", (ev) => {
+          const v = String(ev.target.value || "").trim();
+          this._updateConfig("label_bg_color", v || null);
+        });
+        root.getElementById("label_bg_color_clear")?.addEventListener("click", () => {
+          this._updateConfig("label_bg_color", null);
+          const inp = root.getElementById("label_bg_color");
+          if (inp) inp.value = "#000000";
         });
         // Diagnostics order (auto-discovered sensors)
         const moveDiag = (from, to) => {
@@ -2011,10 +4729,435 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
           });
         });
 
-// Mark as rendered so we don't re-render on subsequent hass/setConfig calls
+        // Chips: add/remove helpers (Hide ports / Uplink ports)
+        const normList = (arr) => {
+          const out = [];
+          const seen = new Set();
+          (arr || []).forEach(v => {
+            const s = String(v || "").trim();
+            if (!s) return;
+            const k = s.toLowerCase();
+            if (seen.has(k)) return;
+            seen.add(k);
+            out.push(s);
+          });
+          return out;
+        };
+
+        const addToList = (key, value) => {
+          const v = String(value || "").trim();
+          if (!v) return;
+          const cur = normList(this._config?.[key]);
+          const exists = cur.some(x => x.toLowerCase() === v.toLowerCase());
+          const next = exists ? cur : [...cur, v];
+                    next.sort((a,b)=>_ssmNaturalPortCompare(a,b));
+          if (!exists) this._updateConfig(key, next);
+        };
+
+        const removeFromList = (key, value) => {
+          const v = String(value || "").trim().toLowerCase();
+          if (!v) return;
+          const cur = normList(this._config?.[key]);
+          const next = cur.filter(x => x.toLowerCase() !== v);
+                    next.sort((a,b)=>_ssmNaturalPortCompare(a,b));
+          this._updateConfig(key, next);
+        };
+
+        const bindChipAdd = (key, inputId, btnId) => {
+          const inp = root.getElementById(inputId);
+          const btn = root.getElementById(btnId);
+          const commit = () => {
+            if (!inp) return;
+            addToList(key, inp.value);
+            inp.value = "";
+          };
+          inp?.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") { e.preventDefault(); commit(); }
+          });
+          btn?.addEventListener("click", (e) => { e.preventDefault(); commit(); });
+          inp?.addEventListener("blur", () => {
+            // don't auto-add on blur; keep explicit
+          });
+        };
+
+        bindChipAdd("hide_ports", "hide_ports_add", "hide_ports_add_btn");
+        bindChipAdd("uplink_ports", "uplink_ports_add", "uplink_ports_add_btn");
+        bindChipAdd("virtual_overrides", "virtual_overrides_add", "virtual_overrides_add_btn");
+
+        this._ssmConvertHintsToHelp(root);
+
+        const addPrefix = (value) => {
+          const v = String(value || "").trim();
+          if (!v) return;
+          const cur = normList(String(this._config?.physical_prefixes || "").split(","));
+          const exists = cur.some(x => x.toLowerCase() === v.toLowerCase());
+          const next = exists ? cur : [...cur, v];
+                    next.sort((a,b)=>_ssmNaturalPortCompare(a,b));
+          if (!exists) this._updateConfig("physical_prefixes", next.join(", "));
+        };
+        const removePrefix = (value) => {
+          const v = String(value || "").trim().toLowerCase();
+          if (!v) return;
+          const cur = normList(String(this._config?.physical_prefixes || "").split(","));
+          const next = cur.filter(x => x.toLowerCase() !== v);
+                    next.sort((a,b)=>_ssmNaturalPortCompare(a,b));
+          this._updateConfig("physical_prefixes", next.join(", "));
+        };
+
+        const bindPrefixAdd = () => {
+          const inp = root.getElementById("physical_prefixes_add");
+          const btn = root.getElementById("physical_prefixes_add_btn");
+          const commit = () => {
+            if (!inp) return;
+            addPrefix(inp.value);
+            inp.value = "";
+          };
+          inp?.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") { e.preventDefault(); commit(); }
+          });
+          btn?.addEventListener("click", (e) => { e.preventDefault(); commit(); });
+        };
+        bindPrefixAdd();
+
+        root.querySelectorAll(".chip[data-chip-kind]").forEach((b) => {
+          b.addEventListener("click", (e) => {
+            e.preventDefault();
+            const kind = String(b.dataset.chipKind || "");
+            const val = String(b.dataset.chipVal || "");
+            if (kind === "hide_ports") removeFromList("hide_ports", val);
+            if (kind === "uplink_ports") removeFromList("uplink_ports", val);
+            if (kind === "virtual_overrides") removeFromList("virtual_overrides", val);
+            if (kind === "physical_prefixes") removePrefix(val);
+          });
+        });
+// Diagnostics order (toggle/reorder/add)
+        const diagList = root.querySelector(".diaglist");
+        if (diagList) {
+          const getDiagOrder = () => {
+            const order = Array.isArray(this._config.diagnostics_order) && this._config.diagnostics_order.length
+              ? [...this._config.diagnostics_order]
+              : ["hostname","manufacturer","model","firmware","uptime"];
+            return order;
+          };
+          const setDiagOrder = (order) => {
+            this._updateConfig("diagnostics_order", order);
+          };
+          const getEnabledMap = () => {
+            const m = (this._config.diagnostics_enabled && typeof this._config.diagnostics_enabled === "object")
+              ? { ...this._config.diagnostics_enabled }
+              : {};
+            return m;
+          };
+          const setEnabledMap = (m) => {
+            this._updateConfig("diagnostics_enabled", m);
+          };
+
+          const toggleDiag = (key) => {
+            const m = getEnabledMap();
+            m[key] = m[key] === false ? true : false;
+            setEnabledMap(m);
+            this._render();
+          };
+
+          diagList.addEventListener("click", (ev) => {
+            const btn = ev.target.closest("button");
+            if (btn) return; // handled below
+            const row = ev.target.closest(".diagitem");
+            if (!row) return;
+            const key = row.getAttribute("data-diag") || "";
+            if (key) toggleDiag(key);
+          });
+
+          diagList.querySelectorAll("button.diag-up").forEach((b) => {
+            b.addEventListener("click", (ev) => {
+              const key = ev.currentTarget.getAttribute("data-diag") || "";
+              const order = getDiagOrder();
+              const i = order.indexOf(key);
+              if (i > 0) {
+                order.splice(i, 1);
+                order.splice(i - 1, 0, key);
+                setDiagOrder(order);
+                this._render();
+              }
+              ev.stopPropagation();
+            });
+          });
+
+          diagList.querySelectorAll("button.diag-down").forEach((b) => {
+            b.addEventListener("click", (ev) => {
+              const key = ev.currentTarget.getAttribute("data-diag") || "";
+              const order = getDiagOrder();
+              const i = order.indexOf(key);
+              if (i !== -1 && i < order.length - 1) {
+                order.splice(i, 1);
+                order.splice(i + 1, 0, key);
+                setDiagOrder(order);
+                this._render();
+              }
+              ev.stopPropagation();
+            });
+          });
+
+          diagList.querySelectorAll("button.diag-remove").forEach((b) => {
+            b.addEventListener("click", (ev) => {
+              const key = ev.currentTarget.getAttribute("data-diag") || "";
+              const order = getDiagOrder().filter((x) => x !== key);
+              setDiagOrder(order);
+              const m = getEnabledMap();
+              delete m[key];
+              setEnabledMap(m);
+              this._render();
+              ev.stopPropagation();
+            });
+          });
+
+          const addBtn = root.getElementById("diag_add_btn");
+          const addInput = root.getElementById("diag_add_input");
+          if (addBtn && addInput) {
+            addBtn.addEventListener("click", () => {
+              const val = String(addInput.value || "").trim();
+              if (!val) return;
+              const order = getDiagOrder();
+              if (!order.includes(val)) order.push(val);
+              setDiagOrder(order);
+              const m = getEnabledMap();
+              m[val] = true;
+              setEnabledMap(m);
+              addInput.value = "";
+              this._render();
+            });
+          }
+        }
+
         this._rendered = true;
       }
-    }
+    
+  
+    _ssmConvertHintsToHelp(root) {
+      // 1) Bind explicit help icons we placed in section headers (Virtual/Uplink/Hide).
+      const helpText = {
+        virtual_overrides:
+          "Interfaces listed here are treated as Virtual. All others are treated as Physical. This affects classification even if the Virtual panel is hidden.",
+        uplink_ports: "Select uplink ports so they can be placed separately from the main port grid in the layout.",
+        hide_ports: "Hidden ports are removed from both Panel and List views.",
+      };
+
+      const HELP_TEXTS = {
+  // Content
+  diagnostics_order: {
+    title: "Diagnostics order",
+    text: "Controls which Diagnostics rows appear and in what order. Click a row to enable/disable it. Use ▲/▼ to reorder; custom sensors can also be removed."
+  },
+  show_diagnostics: {
+    title: "Show Diagnostics",
+    text: "Enable or hide the Diagnostics section on the card. When disabled, diagnostic rows are not shown."
+  },
+  show_virtual: {
+    title: "Show Virtual Interfaces",
+    text: "Show or hide the Virtual Interfaces panel. Classification still uses the override list even if the panel is hidden."
+  },
+  show_uplinks_separately: {
+    title: "Show uplinks separately in layout",
+    text: "When enabled, ports you mark as Uplink ports can be positioned separately in the Layout Editor. This does not change which ports are shown on the card."
+  },
+  // Layout
+  layout_editor: {
+    title: "Layout Editor",
+    text: "Opens an on-card layout editor so you can drag ports into place. Click Save to persist positions locally. Use the X button to exit the editor."
+  },
+  ports_per_row: {
+    title: "Ports per row",
+    text: "Panel view only. Controls how many ports are placed in each row when you are not using custom port positions."
+  },
+  panel_width: {
+    title: "Panel width",
+    text: "Panel view only. Sets the width of the panel canvas (in pixels)."
+  },
+  port_scale: {
+    title: "Port scale",
+    text: "Panel view only. Scales the size of port squares and labels."
+  },
+  port_gap: {
+    title: "Port gap",
+    text: "Panel view only. Spacing between ports when using automatic layout."
+  },
+
+  // Lists
+  virtual_overrides: {
+    title: "Virtual interfaces (override)",
+    text: "Interfaces listed here are treated as Virtual. All others are treated as Physical. This affects classification even if the Virtual panel is hidden."
+  },
+  uplink_ports: {
+    title: "Uplink ports",
+    text: "Select uplink ports so Smart Assist and the Layout Editor can keep them separate from the main port grid (if enabled)."
+  },
+  uplinks: { // backward-compatible key
+    title: "Uplink ports",
+    text: "Select uplink ports so Smart Assist and the Layout Editor can keep them separate from the main port grid (if enabled)."
+  },
+  hide_ports: {
+    title: "Hide ports",
+    text: "Hidden ports are removed from both Panel and List views."
+  },
+
+  // Appearance
+  label_font_color: {
+    title: "Label font color",
+    text: "Overrides the label text color for port labels. Use Clear to return to the default."
+  },
+  label_bg_color: {
+    title: "Label background color",
+    text: "Optional background behind port labels (Panel view) to improve contrast. Use Clear to remove and return to the default."
+  },
+  speed_click_opens_graph: {
+    title: "Open traffic graph on port click",
+    text: "Only applies when Port colors is set to Speed. When enabled, clicking a port opens the bandwidth traffic graph (if bandwidth sensors exist for that port). If no bandwidth sensors are found, the normal port information popup is shown instead."
+  },
+};
+
+const _ensureHelpPopover = (container) => {
+  let pop = document.querySelector(".ssm-help-popover");
+  if (pop) return pop;
+
+  pop = document.createElement("div");
+  pop.className = "ssm-help-popover";
+  pop.setAttribute("role", "dialog");
+  pop.setAttribute("aria-modal", "false");
+  pop.style.position = "fixed";
+  pop.style.display = "none";
+  pop.innerHTML = `
+    <div class="ssm-help-title">
+      <div class="ssm-help-title-text"></div>
+</div>
+    <div class="ssm-help-body"></div>
+  `;
+  container.appendChild(pop);
+
+  const close = () => {
+    pop.style.display = "none";
+    pop.removeAttribute("data-open");
+  };
+
+  // Click outside to close
+  window.addEventListener("pointerdown", (e) => {
+    if (pop.style.display === "none") return;
+    const t = e.target;
+    if (!pop.contains(t) && !t?.closest?.(".helpiconbtn")) close();
+  }, { capture: true });
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") close();
+  });
+
+  return pop;
+};
+
+const _showHelpPopover = (btn, keyOrText, fallbackTitle) => {
+  const pop = _ensureHelpPopover(root);
+
+  const entry = HELP_TEXTS[keyOrText];
+  const title = (entry?.title || fallbackTitle || "Help").trim();
+  const text = (entry?.text || String(keyOrText || "")).trim();
+
+  pop.querySelector(".ssm-help-title-text").textContent = title;
+  pop.querySelector(".ssm-help-body").textContent = text;
+
+  // Position near the button
+  const r = btn.getBoundingClientRect();
+  const pad = 10;
+  pop.style.display = "block";
+  pop.setAttribute("data-open", "1");
+
+  // Temporarily show to measure
+  const pr = pop.getBoundingClientRect();
+  let left = Math.min(window.innerWidth - pr.width - pad, Math.max(pad, r.left));
+  let top = r.bottom + 8;
+  if (top + pr.height + pad > window.innerHeight) {
+    top = Math.max(pad, r.top - pr.height - 8);
+  }
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+};
+
+const bindPopover = (btn, keyOrText, title) => {
+  // Make click target less fiddly: larger, always clickable
+  btn.style.cursor = "pointer";
+  btn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    _showHelpPopover(btn, keyOrText, title);
+  }, { passive: false });
+};
+      root.querySelectorAll(".helpiconbtn[data-help]").forEach((btn) => {
+        const key = btn.getAttribute("data-help") || "";
+        bindPopover(btn, key || "", (btn.getAttribute("data-help-title")||"Help"));
+
+        // Hover tooltip should show the *help text*, not just the title.
+        const entry = HELP_TEXTS[key];
+        const tip = (entry?.text || entry?.title || key || "Help").trim();
+        if (tip) btn.setAttribute("title", tip);
+      });
+
+      // 2) Back-compat: convert remaining inline hint blocks into hover/click help icons.
+      const hints = root.querySelectorAll(".hint");
+    hints.forEach((h) => {
+      const text = (h.textContent || "").trim();
+      const row = h.closest(".row");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "helpiconbtn";
+      btn.setAttribute("aria-label", "Help");
+      btn.innerHTML = `<ha-icon icon="mdi:help-circle-outline"></ha-icon>`;
+      bindPopover(btn, text, (row?.querySelector("label")?.textContent || "Help").trim() || "Help");
+
+      // Prefer placing the icon on the same line as the field title.
+      if (row) {
+        let rowhead = row.querySelector(":scope > .rowhead");
+        if (!rowhead) {
+          const firstLabel = row.querySelector(":scope > label");
+          if (firstLabel) {
+            rowhead = document.createElement("div");
+            rowhead.className = "rowhead";
+            // Move the label into the rowhead so the icon aligns right.
+            row.insertBefore(rowhead, firstLabel);
+            rowhead.appendChild(firstLabel);
+          }
+        }
+        if (rowhead) {
+          rowhead.appendChild(btn);
+          h.remove();
+          return;
+        }
+      }
+
+      // Fallback: replace the hint with an icon line
+      const helpline = document.createElement("div");
+      helpline.className = "helpline";
+      helpline.appendChild(btn);
+      h.replaceWith(helpline);
+    });
+
+    // Ensure any existing help buttons are also aligned with the title row.
+    root.querySelectorAll(".helpiconbtn[data-help]").forEach((btn) => {
+      if (btn.closest(".rowhead")) return;
+      const row = btn.closest(".row");
+      if (!row) return;
+      let rowhead = row.querySelector(":scope > .rowhead");
+      if (!rowhead) {
+        const firstLabel = row.querySelector(":scope > label");
+        if (firstLabel) {
+          rowhead = document.createElement("div");
+          rowhead.className = "rowhead";
+          row.insertBefore(rowhead, firstLabel);
+          rowhead.appendChild(firstLabel);
+        }
+      }
+      if (rowhead) rowhead.appendChild(btn);
+    });
+  }
+
+
+}
 
     // Final guard in case something registered it between our initial check
     if (!customElements.get("snmp-switch-manager-card-editor")) {
