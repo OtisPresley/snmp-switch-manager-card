@@ -148,3 +148,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - 🐞 Port speed reporting unknown when SNMP reporting in bps
+
+---
+
+## [0.3.5-beta.1] - 2026-01-02
+### 🚀 Major UI & Layout Enhancements (Beta)
+This beta release introduces a significantly refined card editor experience, a modernized Layout Editor workflow, and improved interaction behavior — all designed to make switch visualization easier, more intuitive, and more powerful.
+
+### Added
+- 🧩 **Modernized Layout Editor**
+  - Inline enable/disable toggle with contextual help
+  - One-click **exit button** directly on the card to leave Layout Editor instantly
+  - Smarter tool visibility (tools appear only when relevant)
+  - Uplinks layout tool available only when enabled
+- 🧠 **Context-aware editor controls**
+  - Options dynamically appear or hide based on:
+    - View mode (Panel vs List)
+    - Enabled features (Ports, Uplinks, Diagnostics)
+    - Selected color mode
+- 🎨 **Improved Port Color configuration UI**
+  - Compact color swatches with full-width hex input
+  - Optimized layout allowing up to **4 colors per row**
+  - Clearer labeling and reset behavior
+- 📊 **Speed-mode traffic interaction option**
+  - New option (Speed color mode only) to open the **bandwidth graph directly when clicking a port**
+  - Automatically shown only when bandwidth sensors exist for the device
+  - Uses the same modal popup as the Graph button in port details
+- ❓ **Expanded contextual help**
+  - Help icons added throughout the editor
+  - Help text updated to reflect current behavior and best practices
+
+### Improved
+- 🎛️ **Device selector reliability**
+  - Changing the selected switch device now immediately updates the card preview
+- 🖱️ **Port interaction consistency**
+  - Click behavior is consistent across Panel and List views
+  - Graph popups now always open as styled modal dialogs
+- 🧭 **Layout logic clarity**
+  - Options that only affect layout behavior are now clearly scoped to the Layout Editor
+  - Uplinks are no longer rendered separately in the card display
+
+### Notes
+- This is a **beta release** intended for early adopters.
+- Existing configurations remain compatible.
+- Deprecated or unused configuration options are automatically ignored to prevent editor issues.
