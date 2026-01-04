@@ -192,3 +192,8 @@ This beta release introduces a significantly refined card editor experience, a m
 - This is a **beta release** intended for early adopters.
 - Existing configurations remain compatible.
 - Deprecated or unused configuration options are automatically ignored to prevent editor issues.
+
+## [0.3.5-beta.2] - 2026-01-04
+### Fixed
+- 🐞 Loosened restrictions on showing and hiding the Open traffic graph on port click option
+- 🐞 Fixed display of Bandwidth sensor names in the graph and increased the size of the graph
