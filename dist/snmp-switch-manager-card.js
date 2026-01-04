@@ -794,6 +794,64 @@ class SnmpSwitchManagerCard extends HTMLElement {
     return { rxBpsE, txBpsE, rxTotE, txTotE, rxBps, txBps, rxTot, txTot };
   }
 
+  _deviceDisplayNameByPrefix(prefix) {
+    const p = String(prefix || "");
+    const list = Array.isArray(this._snmpDevices) ? this._snmpDevices : [];
+    const hit = list.find((d) => String(d.prefix) === p);
+    return hit ? (hit.name || "") : "";
+  }
+
+  
+  _stripDevicePrefix(label, deviceName, devicePrefix) {
+    let s = String(label || "").trim();
+    if (!s) return s;
+
+    // Normalize helpers
+    const norm = (v) => String(v || "").trim().toLowerCase();
+
+    const dn = String(deviceName || "").trim();
+    const dp = String(devicePrefix || "").trim();
+
+    const candidates = [];
+    if (dn) {
+      candidates.push(dn);
+      // Also include slugged forms of the display name (e.g., "Switch Study" -> "switch-study")
+      const dnNorm = dn.trim().toLowerCase();
+      const dnSlug = dnNorm.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+      const dnUnd = dnNorm.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+      if (dnSlug) candidates.push(dnSlug);
+      if (dnUnd) candidates.push(dnUnd);
+    }
+
+    if (dp) {
+      // prefix as-is, plus common normalized variants
+      candidates.push(dp);
+      candidates.push(dp.replace(/[_-]+/g, " "));
+      candidates.push(dp.replace(/_/g, "-"));
+      candidates.push(dp.replace(/-/g, "_"));
+    }
+
+    // Collapse any immediate duplicated leading token first (e.g., "switch-study switch-study ...")
+    s = s.replace(/^(\S+)\s+\1\s+/i, "$1 ").trim();
+
+    // Remove any leading candidate like "<prefix> " or "<prefix> - " or "<prefix>: "
+    for (const cand of candidates) {
+      const c = String(cand || "").trim();
+      if (!c) continue;
+      const esc = c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re1 = new RegExp("^" + esc + "\\s*[-–:]?\\s*", "i");
+      s = s.replace(re1, "").trim();
+    }
+
+    // If it still starts with a duplicated token (e.g., "switch-study switch-study ..."), collapse it.
+    s = s.replace(/^(\S+)\s+\1\s+/i, "$1 ").trim();
+
+    return s;
+  }
+
+
+
+
   async _openBandwidthGraphDialog(title, rxEntityId, txEntityId, force = false) {
     if (!this._hass || !rxEntityId || !txEntityId) return;
 
@@ -835,14 +893,15 @@ class SnmpSwitchManagerCard extends HTMLElement {
       .ssm-graph-modal-root{z-index:12000;}
       .ssm-graph-modal-root .ssm-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:12000;}
       .ssm-graph-modal-root .ssm-modal{position:fixed;z-index:12001;left:50%;top:50%;transform:translate(-50%,-50%);
-        min-width:320px;max-width:90vw;background:var(--card-background-color);
+        min-width:320px;width:90vw;max-width:900px;background:var(--card-background-color);
         color:var(--primary-text-color);border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,0.5);padding:16px;}
       .ssm-graph-modal-root .ssm-modal-title{font-weight:700;font-size:18px;margin-bottom:8px}
       .ssm-graph-modal-root .ssm-modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
       .ssm-graph-modal-root .btn{font:inherit;padding:8px 12px;border-radius:10px;border:1px solid var(--divider-color);
         background:var(--secondary-background-color);cursor:pointer}
       .ssm-graph-modal-root .btn.subtle{background:transparent}
-      .ssm-graph-host{min-height:260px;}
+      .ssm-graph-host{min-height:260px;width:100%;}
+      .ssm-graph-host > *{width:100%;}
       .ssm-graph-host > *{width:100%;}
     `;
 
@@ -882,14 +941,22 @@ class SnmpSwitchManagerCard extends HTMLElement {
     try {
       const helpers = await window.loadCardHelpers?.();
       if (!helpers) throw new Error("card helpers unavailable");
+      const deviceName = this._deviceDisplayNameByPrefix(this._config?.device);
+
+      const rxFriendly = this._hass?.states?.[rxEntityId]?.attributes?.friendly_name || "";
+      const txFriendly = this._hass?.states?.[txEntityId]?.attributes?.friendly_name || "";
+
+      const rxName = this._stripDevicePrefix(rxFriendly, deviceName, this._config?.device) || "RX Throughput";
+      const txName = this._stripDevicePrefix(txFriendly, deviceName, this._config?.device) || "TX Throughput";
+
       // Use the same (built-in) Statistics Graph card config you showed.
       const card = helpers.createCardElement({
         type: "statistics-graph",
         chart_type: "line",
         period: "5minute",
         entities: [
-          { entity: rxEntityId },
-          { entity: txEntityId },
+          { entity: rxEntityId, name: rxName },
+          { entity: txEntityId, name: txName },
         ],
         stat_types: ["mean", "max", "min"],
         title: `${title} Throughput`,
@@ -1056,23 +1123,71 @@ class SnmpSwitchManagerCard extends HTMLElement {
       return `<div><b>${label}</b> ${value}</div>`;
     };
 
-    const rowsHtml = [
-      _row("Admin:", attrs.Admin ?? "-"),
-      _row("Oper:", attrs.Oper ?? "-"),
-      _row("Speed:", speed ?? "-"),
-      hasRates ? _row("RX:", `${rxRate} <span class="hint">(${rxTotS})</span>`) : "",
-      hasRates ? _row("TX:", `${txRate} <span class="hint">(${txTotS})</span>`) : "",
-      _row("VLAN ID:", vlanId),
-      _row("Native VLAN:", nativeVlan),
-      _row("Allowed VLANs:", allowedVlans),
-      _row("Untagged VLANs:", untaggedVlans),
-      _row("Tagged VLANs:", taggedVlans),
-      // show trunk if explicitly boolean or non-blank
-      (_isBlank(trunk) ? "" : _row("Trunk:", (typeof trunk === "boolean") ? (trunk ? "true" : "false") : trunk)),
-      _row("IP:", attrs.IP),
-      _row("Index:", attrs.Index ?? "-"),
-      // Alias row handled separately below
-    ].filter(Boolean).join("");
+        const _prettyKey = (k) => String(k || "")
+      .replace(/_/g, " ")
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const _normAttrVal = (v) => {
+      if (Array.isArray(v)) return v.join(", ");
+      if (v && typeof v === "object") {
+        try {
+          const s = JSON.stringify(v);
+          // Avoid huge blobs in the UI
+          return (s.length > 300) ? (s.slice(0, 300) + "…") : s;
+        } catch (e) {
+          return String(v);
+        }
+      }
+      return v;
+    };
+
+    const rows = [];
+    const used = new Set(["name", "alias"]);
+
+    const _add = (key, label, value) => {
+      if (_isBlank(value)) return;
+      rows.push(_row(label, _normAttrVal(value)));
+      if (key) used.add(String(key).toLowerCase());
+    };
+
+    // Common, high-signal fields first (vendor neutral)
+    _add("admin", "Admin:", attrs.Admin);
+    _add("oper", "Oper:", attrs.Oper);
+    _add("speed", "Speed:", attrs.Speed);
+    _add("duplex", "Duplex:", attrs.Duplex);
+    _add("poe", "PoE:", attrs.PoE ?? attrs.Poe ?? attrs.POE);
+
+    // VLAN / trunk fields (use normalized computed values where available)
+    _add("vlan id", "VLAN ID:", vlanId);
+    _add("native vlan", "Native VLAN:", nativeVlan);
+    _add("allowed vlans", "Allowed VLANs:", allowedVlans);
+    _add("untagged vlans", "Untagged VLANs:", untaggedVlans);
+    _add("tagged vlans", "Tagged VLANs:", taggedVlans);
+    if (!_isBlank(trunk)) {
+      _add("trunk", "Trunk:", (typeof trunk === "boolean") ? (trunk ? "true" : "false") : trunk);
+    }
+
+    // Addressing / index
+    _add("ip", "IP:", attrs.IP);
+    _add("index", "Index:", (attrs.Index ?? "-"));
+
+    // Then show every remaining attribute (excluding Name/Alias) in a stable order
+    const extraEntries = Object.entries(attrs || {})
+      .filter(([k, v]) => !used.has(String(k).toLowerCase()) && !_isBlank(v))
+      .filter(([k, v]) => {
+        // Skip some noisy/internal keys if they ever appear
+        const kl = String(k).toLowerCase();
+        return !(kl === "entity_id" || kl === "device" || kl === "ports");
+      })
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+
+    for (const [k, v] of extraEntries) {
+      rows.push(_row(_prettyKey(k) + ":", _normAttrVal(v)));
+    }
+
+    const rowsHtml = rows.join("");
 
     this._modalEl.innerHTML = `
       <div class="ssm-backdrop"></div>
@@ -3816,26 +3931,29 @@ _listDevicesFromHass() {
         return out;
       }
 
-
       _deviceHasBandwidthSensors(prefix) {
         const hass = this._hass;
-        const pfx = String(prefix || "").trim();
+        const pfx = String(prefix || "").trim().toLowerCase();
         if (!hass || !pfx) return false;
 
-        // Bandwidth sensors follow the per-port entity_id base:
-        //   switch.<base>  -> sensor.<base>_rx_throughput / sensor.<base>_tx_throughput
-        const ports = this._portsForPrefix(pfx) || [];
-        for (const p of ports) {
-          const eid = String(p.entity_id || "").trim();
-          if (!eid) continue;
-          const baseObj = eid.split(".")[1] || "";
-          if (!baseObj) continue;
-          const rx = `sensor.${baseObj}_rx_throughput`;
-          const tx = `sensor.${baseObj}_tx_throughput`;
-          if (hass.states?.[rx] && hass.states?.[tx]) return true;
+        // Bandwidth sensor entity_ids are derived from the device prefix, but may not
+        // share the same base as the per-port switch entity_id on all vendors.
+        // We consider bandwidth "available" if we can find any RX/TX throughput pair
+        // for this device prefix.
+        const rxSuffix = "_rx_throughput";
+        const states = hass.states || {};
+        for (const eid of Object.keys(states)) {
+          if (!eid || typeof eid !== "string") continue;
+          const e = eid.toLowerCase();
+          if (!e.startsWith(`sensor.${pfx}_`)) continue;
+          if (!e.endsWith(rxSuffix)) continue;
+
+          const tx = eid.slice(0, -rxSuffix.length) + "_tx_throughput";
+          if (states[tx]) return true;
         }
         return false;
       }
+
 
 
 
