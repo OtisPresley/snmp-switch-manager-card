@@ -1144,7 +1144,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
     };
 
     const rows = [];
-    const used = new Set(["name", "alias"]);
+    const used = new Set(["name", "alias", "friendly_name", "friendly name"]);
 
     const _add = (key, label, value) => {
       if (_isBlank(value)) return;
@@ -1158,6 +1158,23 @@ class SnmpSwitchManagerCard extends HTMLElement {
     _add("speed", "Speed:", attrs.Speed);
     _add("duplex", "Duplex:", attrs.Duplex);
     _add("poe", "PoE:", attrs.PoE ?? attrs.Poe ?? attrs.POE);
+
+    // Bandwidth sensors (non-attribute info) — derived from switch port entity_id base.
+    // This stays stable even if the user changes port display names via rename rules.
+    const hass = this._hass;
+    const hasBwSensors =
+      (rxRateE && hass?.states?.[rxRateE]) ||
+      (txRateE && hass?.states?.[txRateE]) ||
+      (rxTotE && hass?.states?.[rxTotE]) ||
+      (txTotE && hass?.states?.[txTotE]);
+
+    if (hasBwSensors) {
+      _add("rx throughput", "RX Throughput:", rxRate);
+      _add("tx throughput", "TX Throughput:", txRate);
+      _add("rx total", "RX Total:", rxTotS);
+      _add("tx total", "TX Total:", txTotS);
+    }
+
 
     // VLAN / trunk fields (use normalized computed values where available)
     _add("vlan id", "VLAN ID:", vlanId);
@@ -1179,7 +1196,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
       .filter(([k, v]) => {
         // Skip some noisy/internal keys if they ever appear
         const kl = String(k).toLowerCase();
-        return !(kl === "entity_id" || kl === "device" || kl === "ports");
+        return !(kl === "entity_id" || kl === "device" || kl === "ports" || kl === "friendly_name" || kl === "friendly name");
       })
       .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
 
