@@ -1169,10 +1169,15 @@ class SnmpSwitchManagerCard extends HTMLElement {
       (txTotE && hass?.states?.[txTotE]);
 
     if (hasBwSensors) {
-      _add("rx throughput", "RX Throughput:", rxRate);
-      _add("tx throughput", "TX Throughput:", txRate);
-      _add("rx total", "RX Total:", rxTotS);
-      _add("tx total", "TX Total:", txTotS);
+      const rxLine = (rxRate != null && rxRate !== "-")
+        ? `${rxRate}${(rxTotS != null && rxTotS !== "-") ? ` (${rxTotS})` : ""}`
+        : "-";
+      const txLine = (txRate != null && txRate !== "-")
+        ? `${txRate}${(txTotS != null && txTotS !== "-") ? ` (${txTotS})` : ""}`
+        : "-";
+
+      _add("rx", "RX:", rxLine);
+      _add("tx", "TX:", txLine);
     }
 
 
