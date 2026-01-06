@@ -197,3 +197,36 @@ This beta release introduces a significantly refined card editor experience, a m
 ### Fixed
 - 🐞 Loosened restrictions on showing and hiding the Open traffic graph on port click option
 - 🐞 Fixed display of Bandwidth sensor names in the graph and increased the size of the graph
+
+---
+
+## [0.3.5-beta.3] - 2026-01-06
+### Added
+- 🖥️ **Automatic card scaling for large displays**
+  - Card now automatically scales to available space (e.g., 4K displays)
+  - Prevents tiny, unreadable cards on high-resolution dashboards
+- 🏷️ **Advanced label positioning**
+  - Labels can be positioned **Above**, **Below**, **Inside**, or **Split (2 row)**
+  - Split mode renders top-row labels above ports and bottom-row labels below ports
+- 🔢 **Numeric port label enhancements**
+  - Port labels can extract and display the right-most numeric portion of interface names (e.g., `2.5G 1`, `10G 2`)
+  - Optional **black outline** for numeric labels improves contrast on bright backgrounds
+- 🔒 **Optional read-only safety mode**
+  - New option to hide all **Turn on / Turn off** buttons from the card UI
+  - Useful for dashboards where accidental port toggles should be prevented
+
+### Improved
+- 🎨 **Label readability**
+  - Numeric label outlines use SVG stroke rendering for crisp text in both Light and Dark themes
+- 🧭 **Layout Editor behavior**
+  - Label movement remains correctly aligned with ports during layout calibration
+  - Snap and gap behavior remains consistent regardless of label configuration
+ 
+### Fixed
+- 🐞 **Label rendering stability**
+  - Port labels now behave as true overlays and no longer change panel height
+  - Background images no longer appear to “shift” when labels are enabled
+- 🐞 **Editor toggle state consistency**
+  - Fixed editor switches not reflecting saved configuration state (e.g., Outline port numbers)
+- 🐞 **Speed aggregation with no device selected**
+  - When no switch device is selected, port speeds are correctly detected and displayed instead of showing `Unknown`
