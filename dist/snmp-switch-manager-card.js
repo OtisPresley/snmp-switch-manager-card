@@ -133,10 +133,30 @@ class SnmpSwitchManagerCard extends HTMLElement {
     this._editingFields = new Set();
 }
 
+
+_layoutEditorSessionKey() {
+  const dev = String(this._config?.device || "all");
+  const title = String(this._config?.title || "");
+  return `ssm_layout_editor_closed:${dev}:${title}`;
+}
+
+_isLayoutEditorClosedBySession() {
+  try { return sessionStorage.getItem(this._layoutEditorSessionKey()) === "1"; }
+  catch (e) { return false; }
+}
+
+_clearLayoutEditorSessionClosed() {
+  try { sessionStorage.removeItem(this._layoutEditorSessionKey()); } catch (e) {}
+}
+
+_setLayoutEditorSessionClosed() {
+  try { sessionStorage.setItem(this._layoutEditorSessionKey(), "1"); } catch (e) {}
+}
+
   setConfig(config) {
     config = _ssmNormalizeConfig(config);
 
-    const prevCalib = !!this._config?.calibration_mode;
+    const prevCalib = this._isCalibrationEnabled();
 
     this._config = {
       title: config.title ?? "",
@@ -162,7 +182,15 @@ class SnmpSwitchManagerCard extends HTMLElement {
       gap: Number.isFinite(config.gap) ? Number(config.gap) : 10,
       show_labels: config.show_labels !== false,
       label_numbers_only: config.label_numbers_only === true,
+      label_outline: config.label_outline === true,
       label_size: Number.isFinite(config.label_size) ? Number(config.label_size) : 8,
+      label_position: (config.label_position === "above" || config.label_position === "inside" || config.label_position === "below" || config.label_position === "split")
+        ? config.label_position
+        : "below",
+
+      // If true, hide all in-card Turn on/Turn off buttons (virtual interfaces + port popup)
+      // for users who want a "view-only" card.
+      hide_control_buttons: config.hide_control_buttons === true,
 
       // choose where Diagnostics/Virtual block appears
       info_position: (config.info_position === "below") ? "below" : "above",
@@ -226,6 +254,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
       // Label options
       label_numbers_only: config.label_numbers_only === true,
+      label_outline: config.label_outline === true,
 
       // Uplinks (Smart Assist)
       show_uplinks_separately: config.show_uplinks_separately === true,
@@ -262,7 +291,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
     // to rebuild its entire DOM. That rebuild cancels pointer capture (drag 'drops') and resets
     // the calibration JSON textarea scroll. Mirror the existing graph/modal strategy: freeze
     // renders during calibration and let the user finish positioning first.
-    if (this._config?.calibration_mode && this._freezeRenderWhileCalibrationActive) {
+    if (this._isCalibrationEnabled() && this._freezeRenderWhileCalibrationActive) {
       return;
     }
 
@@ -290,7 +319,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
           <div style="font-weight:600; margin-bottom:8px;">SNMP Switch Manager Card error</div>
           <pre style="white-space:pre-wrap; font-size:12px; opacity:0.85;">${msg.replace(/</g,"&lt;")}</pre>
         </ha-card>`;
-    }
+            }
   }
 
 
@@ -569,7 +598,8 @@ class SnmpSwitchManagerCard extends HTMLElement {
       "40 Gbps": "#a855f7",      // purple
       "50 Gbps": "#d946ef",      // fuchsia
       "100 Gbps": "#ec4899",     // pink
-      "Unknown": "#ef4444",      // red
+      "Disconnected": "#ef4444", // red (was Unknown)
+      "Unknown": "#ef4444",      // legacy key
     };
   }
 
@@ -594,7 +624,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
 
     // Prefer an already-normalized human string if the integration provides it.
     const candidates = [
-      attrs.SpeedLabel, attrs.speed_label, attrs.speedLabel, attrs.speedText, attrs.speed_text,
+      attrs.SpeedLabel, attrs.speed_label, attrs.speedLabel, attrs.speedText, attrs.speed_text, attrs.SpeedDisplay, attrs.speed_display, attrs.speedDisplay,
       attrs.LinkSpeedLabel, attrs.link_speed_label, attrs.LinkSpeedText, attrs.link_speed_text,
       attrs.PortSpeedLabel, attrs.port_speed_label,
       attrs.Speed, attrs.speed, attrs.PortSpeed, attrs.port_speed, attrs.link_speed, attrs.LinkSpeed,
@@ -602,9 +632,21 @@ class SnmpSwitchManagerCard extends HTMLElement {
     ].filter(v => v != null);
 
     for (const raw of candidates) {
+      if (typeof raw === "number" && Number.isFinite(raw)) {
+        // Some integrations expose ifSpeed/link_speed as a number (bps). Treat large values as bps.
+        // A value of 0 (or negative) is treated as a disconnected/no-link state.
+        if (raw <= 0) return "Disconnected";
+        const mbps = (raw > 100000) ? (raw / 1e6) : raw;
+        return mbps;
+      }
       if (typeof raw !== "string") continue;
       const s0 = raw.trim();
       if (!s0) continue;
+
+      const s0l = s0.toLowerCase();
+      if (s0l.includes("disconnected") || s0l.includes("notpresent") || s0l.includes("not present")) {
+        return "Disconnected";
+      }
 
       // Normalize formats like "2.5Gbps", "100Mbps", "1 Gbps", "10 mbps"
       const s = s0.replace(/\s+/g, " ").trim();
@@ -638,7 +680,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
       const attrs = st?.attributes || null;
 
       // Prefer the integration's normalized human label when available.
-      const label = this._speedLabelFromAttrs(attrs) || "Unknown";
+      const label = this._speedLabelFromAttrs(attrs) || "Disconnected";
 
       // Per-speed override (stored in config) wins over defaults.
       const overrides = this._config?.speed_colors || null;
@@ -646,7 +688,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
       if (typeof overrideColor === "string" && overrideColor.trim()) return overrideColor.trim();
 
       // Default palette.
-      return palette[label] || palette["Unknown"];
+      return palette[label] || palette["Disconnected"];
     }
 
     // Default: represent port state via Admin/Oper
@@ -682,47 +724,42 @@ class SnmpSwitchManagerCard extends HTMLElement {
   }
 
 
-  _parseSpeedMbps(attrs) {
-    // Accepts common attribute names and formats.
-    // Returns exact bucket values (10/100/1000/10000) or null for unknown.
-    if (!attrs) return null;
-    const raw =
-      attrs.Speed ?? attrs.speed ?? attrs.ifSpeed ?? attrs.if_speed ??
-      attrs.PortSpeed ?? attrs.port_speed ?? attrs.link_speed ?? attrs.LinkSpeed;
 
-    if (raw == null) return null;
+_parseSpeedMbps(attrs) {
+  // Returns bucket Mbps values (10/100/1000/2500/5000/10000/...) or null.
+  const a = attrs || {};
+  const raw =
+    a.Speed ?? a.speed ?? a.ifSpeed ?? a.ifspeed ?? a.if_speed ??
+    a.ifHighSpeed ?? a.ifhighspeed ??
+    a.PortSpeed ?? a.port_speed ?? a.link_speed ?? a.LinkSpeed ?? a.linkSpeed;
 
-    // Numeric: could be Mbps, bps, or occasionally kbps.
-    if (typeof raw === "number" && Number.isFinite(raw)) {
-      const v = raw;
-      // Heuristic: if >= 1,000,000 treat as bps; else treat as Mbps.
-      const mbps = (v >= 1_000_000) ? Math.round(v / 1_000_000) : Math.round(v);
-      return this._speedBucket(mbps);
-    }
+  if (raw == null || raw === "") return null;
 
-    const s = String(raw).trim().toLowerCase();
+  // String speeds: allow "1 Gbps", "100 Mbps", "2.5Gbps", and let "Disconnected" flow as non-numeric.
+  if (typeof raw === "string") {
+    const s = raw.trim();
+    const sl = s.toLowerCase();
     if (!s) return null;
-
-    // Common text forms: "10M", "100 Mbps", "1G", "10G", "1000", "1 gbps", etc.
-    // Normalize separators.
-    const norm = s.replace(/\s+/g, "");
-
-    // Fast path for explicit G/M tokens.
-    if (/(^|\D)10g($|\D)/.test(norm) || /10gbps/.test(norm) || /10000m/.test(norm)) return 10000;
-    if (/(^|\D)1g($|\D)/.test(norm) || /1gbps/.test(norm) || /1000m/.test(norm)) return 1000;
-    if (/(^|\D)100m($|\D)/.test(norm) || /100mbps/.test(norm)) return 100;
-    if (/(^|\D)10m($|\D)/.test(norm) || /10mbps/.test(norm)) return 10;
-
-    // Pure numeric string.
-    const num = Number(norm);
-    if (Number.isFinite(num)) {
-      // Same heuristic as above.
-      const mbps = (num >= 1_000_000) ? Math.round(num / 1_000_000) : Math.round(num);
-      return this._speedBucket(mbps);
+    if (sl.includes("disconnected") || sl.includes("notpresent") || sl.includes("not present") || sl === "down") {
+      return null;
     }
 
-    return null;
+    const mm = s.match(/([\d.]+)\s*([kmg]?)(?:b?ps)?/i);
+    if (!mm) return null;
+    const val = Number(mm[1]);
+    if (!Number.isFinite(val) || val <= 0) return null;
+    const unit = (mm[2] || "").toLowerCase();
+    const mbps = unit == "g" ? val * 1000 : unit == "k" ? val / 1000 : val;
+    return this._speedBucket(Math.round(mbps));
   }
+
+  // Numeric: if it's very large, assume bps; else assume Mbps (covers ifHighSpeed which is often Mbps).
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const mbps = (n >= 1_000_000) ? Math.round(n / 1_000_000) : Math.round(n);
+  return this._speedBucket(mbps);
+}
+
 
   _speedBucket(mbps) {
     if (mbps === 10) return 10;
@@ -1224,7 +1261,7 @@ class SnmpSwitchManagerCard extends HTMLElement {
           </div>
         </div>
         <div class="ssm-modal-actions">
-          <button class="btn wide" data-entity="${entity_id}">${this._buttonLabel(st)}</button>
+          ${this._config.hide_control_buttons ? "" : `<button class="btn wide" data-entity="${entity_id}">${this._buttonLabel(st)}</button>`}
           ${canGraph ? `<button class="btn subtle" data-bw-graph="1">Graph</button>` : ``}
           <button class="btn subtle" data-close="1">Close</button>
         </div>
@@ -1400,8 +1437,24 @@ class SnmpSwitchManagerCard extends HTMLElement {
     return;
   }
 
+_isCalibrationEnabled() {
+  const enabled = !!this._config?.calibration_mode;
+  if (!enabled) return false;
+
+  // If the user clicked Exit, persist a "force off" flag so it stays off on the dashboard
+  // until explicitly re-enabled in the card editor.
+  try {
+    const prefix = this._config?.device ? String(this._config.device) : "all";
+    const k = `ssm_calib_force_off:${prefix}`;
+    if (localStorage.getItem(k)) return false;
+  } catch (e) {}
+
+  return true;
+}
+
+
   _setupCalibrationUI() {
-    const enabled = !!this._config?.calibration_mode;
+    const enabled = this._isCalibrationEnabled();
 
     // Clear any prior calibration state when disabled
     if (!enabled) {
@@ -1519,8 +1572,28 @@ class SnmpSwitchManagerCard extends HTMLElement {
       this._calibMap[key] = { x, y };
       const r = getPortRect(g);
       if (r) {
+        const oldX = Number(r.getAttribute("x") || "0");
+        const oldY = Number(r.getAttribute("y") || "0");
         r.setAttribute("x", String(x));
         r.setAttribute("y", String(y));
+        const dx = x - oldX;
+        const dy = y - oldY;
+        if (Number.isFinite(dx) && Number.isFinite(dy) && (dx !== 0 || dy !== 0)) {
+          const t = root.querySelector(`text.portlabel[data-entity="${CSS.escape(entityId)}"]`);
+          if (t) {
+            const tx = Number(t.getAttribute("x") || "0") + dx;
+            const ty = Number(t.getAttribute("y") || "0") + dy;
+            t.setAttribute("x", String(tx));
+            t.setAttribute("y", String(ty));
+          }
+          const bg = root.querySelector(`rect.portlabel-bg[data-entity="${CSS.escape(entityId)}"]`);
+          if (bg) {
+            const bx = Number(bg.getAttribute("x") || "0") + dx;
+            const by = Number(bg.getAttribute("y") || "0") + dy;
+            bg.setAttribute("x", String(bx));
+            bg.setAttribute("y", String(by));
+          }
+        }
       }
     };
 
@@ -1584,8 +1657,26 @@ class SnmpSwitchManagerCard extends HTMLElement {
         const xy = (key && this._calibMap && this._calibMap[key]) ? this._calibMap[key] : null;
         const r = getPortRect(g);
         if (r && xy && Number.isFinite(Number(xy.x)) && Number.isFinite(Number(xy.y))) {
-          r.setAttribute('x', String(xy.x));
-          r.setAttribute('y', String(xy.y));
+          const oldX = Number(r.getAttribute("x") || "0");
+          const oldY = Number(r.getAttribute("y") || "0");
+          const nx = Number(xy.x);
+          const ny = Number(xy.y);
+          r.setAttribute('x', String(nx));
+          r.setAttribute('y', String(ny));
+          const dx = nx - oldX;
+          const dy = ny - oldY;
+          if (Number.isFinite(dx) && Number.isFinite(dy) && (dx !== 0 || dy !== 0)) {
+            const t = root.querySelector(`text.portlabel[data-entity="${CSS.escape(id)}"]`);
+            if (t) {
+              t.setAttribute("x", String(Number(t.getAttribute("x") || "0") + dx));
+              t.setAttribute("y", String(Number(t.getAttribute("y") || "0") + dy));
+            }
+            const bg = root.querySelector(`rect.portlabel-bg[data-entity="${CSS.escape(id)}"]`);
+            if (bg) {
+              bg.setAttribute("x", String(Number(bg.getAttribute("x") || "0") + dx));
+              bg.setAttribute("y", String(Number(bg.getAttribute("y") || "0") + dy));
+            }
+          }
         }
       });
 
@@ -1935,12 +2026,10 @@ class SnmpSwitchManagerCard extends HTMLElement {
         elOrder.addEventListener("change", () => {
           this._calibPortsOrder = (elOrder.value || "numeric");
           this._calibDirty = true;
-          // Reflow ports immediately if the Ports box tool is active
-          if (this._calibPortsBoxMode) {
-            applyPortsBoxLayout();
-            if (elAdv?.style?.display !== "none") refreshExport();
-          }
-        });
+                    // Do not reflow existing port positions when changing order.
+          // Order is used by explicit layout actions (Align/Distribute) and exports.
+          if (elAdv?.style?.display !== "none") refreshExport();
+});
       }
     }
 
@@ -1986,10 +2075,12 @@ class SnmpSwitchManagerCard extends HTMLElement {
     if (elSnap && !elSnap._ssmBound) {
       elSnap._ssmBound = true;
       elSnap.value = String(this._calibSnap || 0);
-      elSnap.addEventListener("change", () => {
+      const onSnap = () => {
         this._calibSnap = parseInt(elSnap.value, 10) || 0;
-      });
-    }
+      };
+      elSnap.addEventListener("input", onSnap);
+      elSnap.addEventListener("change", onSnap);
+}
 
     // Advanced toggle
     if (elAdvToggle && !elAdvToggle._ssmBound) {
@@ -2148,9 +2239,8 @@ class SnmpSwitchManagerCard extends HTMLElement {
       this._freezeRenderWhileCalibrationActive = false;
       // Persist a "force off" flag so the card editor toggle resets even if the editor is not open.
       try {
-        const prefix = (this._config?.device || "") ? String(this._config.device) : "unknown";
-        const bg = String(this._config?.background_image || "");
-        localStorage.setItem(`ssm_calib_force_off:${prefix}:${bg}`, String(Date.now()));
+        const prefix = (this._config?.device || "") ? String(this._config.device) : "all";
+        localStorage.setItem(`ssm_calib_force_off:${prefix}`, String(Date.now()));
       } catch (e) {}
       this._calibUiClosed = false;
 
@@ -2815,7 +2905,7 @@ if (boxSelecting && boxStart) {
         if (!id) return;
 
         // Selection logic
-        if (ev.shiftKey) {
+        if ((ev.ctrlKey || ev.metaKey)) {
           if (this._calibSel.has(id)) this._calibSel.delete(id);
           else this._calibSel.add(id);
         } else {
@@ -2922,7 +3012,9 @@ if (boxSelecting && boxStart) {
       .panel-wrap { border-radius:12px; border:1px solid var(--divider-color);
         /* Prefer HA theme vars; fall back to card background for themes that don't set --ha-card-background */
         padding:6; background: color-mix(in oklab, var(--ha-card-background, var(--card-background-color, #1f2937)) 75%, transparent); }
-      .panel-wrap.bg { background-repeat:no-repeat; background-position:center; background-size:contain; }
+      /* Keep background aligned to the top so enabling labels doesn't visually "push" the image down.
+         When the panel height changes (e.g., label rows), centered backgrounds will appear to shift. */
+      .panel-wrap.bg { background-repeat:no-repeat; background-position:top center; background-size:contain; }
 
       .port-svg.calib-selected rect { stroke: rgba(255,255,255,.9); stroke-width: 2; }
       .calib-tools{ margin:12px 16px 16px 16px; padding:12px; border:1px dashed var(--divider-color); border-radius:12px; background:rgba(0,0,0,.12); }
@@ -2940,9 +3032,16 @@ if (boxSelecting && boxStart) {
       
       .calib-inline{ display:flex; align-items:center; gap:6px; font-size:12px; color:var(--secondary-text-color); padding:4px 8px; border:1px solid var(--divider-color); border-radius:10px; }
       .calib-inline select{ background:var(--card-background-color); color:var(--primary-text-color); border:1px solid var(--divider-color); border-radius:8px; padding:4px 6px; }
-      .calib-msg{ margin-left:8px; }
+      
+      .calib-snap-input{ width:86px; height:32px; min-height:32px; max-height:32px; padding:0 8px; box-sizing:border-box; border-radius:8px; border:1px solid var(--divider-color); background:var(--card-background-color); color:var(--primary-text-color); font-size:12px; line-height:32px; text-align:center; }
+      .calib-snap-input:focus{ outline:none; border-color:var(--primary-color); }
+.calib-msg{ margin-left:8px; }
 
-    `;
+    
+      /* Auto-scale wrapper (responsive on large displays like 4K) */
+      .autoscale-outer{ width:100%; overflow:visible; }
+      .autoscale-inner{ transform-origin: top left; will-change: transform; }
+`;
 
     const header = this._config.title ? `<div class="head">${this._config.title}</div>` : "";
 
@@ -2999,10 +3098,13 @@ if (boxSelecting && boxStart) {
           if (alias) titleParts.push(`${alias}`);
           titleParts.push(`${n}${ip}`);
           const title = titleParts.join(" • ");
+          const btn = this._config.hide_control_buttons
+            ? ""
+            : `<button class="btn" data-entity="${id}">${this._buttonLabel(st)}</button>`;
           return `<div class="virt-row" title="${title}">
             <span class="dot" style="background:${this._colorFor(st)}"></span>
             <span class="virt-name" data-alias-entity="${id}">${n}${ip}</span>
-            <button class="btn" data-entity="${id}">${this._buttonLabel(st)}</button>
+            ${btn}
           </div>`;
         }).join("");
         return `<div class="box"><div class="virt-title">Virtual Interfaces</div>${rows}</div>`;
@@ -3035,25 +3137,30 @@ if (boxSelecting && boxStart) {
         if (alias) titleParts.push(`${alias}`);
         titleParts.push(`${name}${ip}`);
         const title = titleParts.join(" • ");
+        const btn = this._config.hide_control_buttons
+          ? ""
+          : `<button class="btn wide" data-entity="${id}">${this._buttonLabel(st)}</button>`;
         return `<div class="port" title="${title}">
           <div class="name" data-alias-entity="${id}">${name}</div>
           <div class="kv"><span class="dot" style="background:${this._colorFor(st)}"></span>
             ${this._config.color_mode === "speed" ? `Speed: ${(this._speedLabelFromAttrs(a) || a.Speed || a.speed || "-")}` : `State: ${(a.Admin ?? "-")}/${(a.Oper ?? "-")}`}${ip}
           </div>
-          <button class="btn wide" data-entity="${id}">${this._buttonLabel(st)}</button>
+          ${btn}
         </div>`;
       };
 
       const mainGrid = mainPhys.map(renderPort).join("");
 
       return `
+        <div class="autoscale-outer"><div class="autoscale-inner">
         ${this._config.info_position === "above" ? infoGrid : ""}
         <div class="section">
           ${mainPhys.length ? `
             <div class="grid">${mainGrid}</div>
           ` : `<div class="hint">No physical ports discovered.</div>`}
         </div>
-        ${this._config.info_position === "below" ? infoGrid : ""}`;
+        ${this._config.info_position === "below" ? infoGrid : ""}
+        </div></div>`;
     };
 
     const panelView = () => {
@@ -3074,8 +3181,14 @@ if (boxSelecting && boxStart) {
       const perRow = Math.max(1, this._config.ports_per_row);
       const rows = Math.max(1, Math.ceil((panelPorts.length || perRow) / perRow));
       const W = this._config.panel_width;
-      const topPad = 24, sidePad = 28, rowPad = (this._config.show_labels ? (this._config.label_size + 14) : 18);
-      const H = 20 + topPad + rows * (P + G) + rowPad;
+      const topPad = 24, sidePad = 28;
+      // Labels are drawn in an overlay SVG layer and should not force extra panel height.
+      // We keep a small constant bottom padding for the port area; true label overflow
+      // is handled later by expanding maxBottom only when a label would extend past
+      // the current SVG bounds.
+      const rowPad = 18;
+      let H = 20 + topPad + rows * (P + G) + rowPad;
+      let maxBottom = H;
       const plate = useBg ? "" : `<rect x="10" y="10" width="${W - 20}" height="${H - 20}" rx="8"
         fill="var(--ha-card-background, var(--card-background-color, #1f2937))" stroke="var(--divider-color, #4b5563)"/>`;
 
@@ -3092,7 +3205,7 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
       // 1) Live map while Layout Editor is active
       // 2) Persisted layout from localStorage (applies even when Layout Editor is off)
       // 3) Config-provided port_positions (legacy/manual)
-      const portPosRaw = (this._config.calibration_mode && this._calibMap && typeof this._calibMap === "object")
+      const portPosRaw = (this._isCalibrationEnabled() && this._calibMap && typeof this._calibMap === "object")
         ? this._calibMap
         : ((storedMap && typeof storedMap === "object")
             ? storedMap
@@ -3104,6 +3217,47 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
         : null;
 
       const labels = [];
+
+      // For "Split (2 row)" labels, decide above/below by actual Y position (top vs bottom row),
+      // rather than by i/perRow (which can be wrong when portsPerRow doesn't match the rendered rows).
+      let _splitMidY = null;
+      const _labelPosMode = (this._config.label_position || "below");
+      if (this._config.show_labels && _labelPosMode === "split") {
+        let _minY = Infinity;
+        let _maxY = -Infinity;
+        for (let _i = 0; _i < panelPorts.length; _i++) {
+          const [_id, _st] = panelPorts[_i];
+          const _a = (_st && _st.attributes) ? _st.attributes : {};
+          const _name = String(_a.Name || String(_id || "").split(".")[1] || "");
+          if (_ssmIsHiddenPort(this._config, _name, _id)) continue;
+
+          const _idx = _i % perRow, _row = Math.floor(_i / perRow);
+          let _x = sidePad + _idx * slotW + (slotW - P) / 2;
+          let _y = topPad + _row * (P + G) + 18;
+
+          if (portPos) {
+            const _key = String(_name).trim().toLowerCase();
+            const _ov = portPos.get(_key) || portPos.get(String(((_id || "").split(".")[1] || "")).trim().toLowerCase());
+            if (_ov && typeof _ov === "object") {
+              const _ox = Number(_ov.x);
+              const _oy = Number(_ov.y);
+              if (Number.isFinite(_ox)) _x = _ox;
+              if (Number.isFinite(_oy)) _y = _oy;
+            }
+          }
+
+          _x += offX;
+          _y += offY;
+
+          if (Number.isFinite(_y)) {
+            if (_y < _minY) _minY = _y;
+            if (_y > _maxY) _maxY = _y;
+          }
+        }
+        if (Number.isFinite(_minY) && Number.isFinite(_maxY) && _maxY > _minY) {
+          _splitMidY = (_minY + _maxY) / 2;
+        }
+      }
       const rects = panelPorts.map(([id, st], i) => {
         const a = st.attributes || {};
         const name = String(a.Name || id.split(".")[1] || "");
@@ -3130,6 +3284,11 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
         y += offY;
         const fill = this._colorFor(st);
         const Ps = P * scale;
+        // Ensure the SVG viewBox grows to include any custom-positioned ports.
+// (Label extents are accounted for after label geometry is computed.)
+if (Number.isFinite(y) && Number.isFinite(Ps)) {
+  maxBottom = Math.max(maxBottom, y + Ps + 12);
+}
         const labelColor = this._config.label_color || this._config.label_font_color || "var(--primary-text-color)";
         const labelBg = this._config.label_bg_color || this._config.label_background_color || "";
         if (this._config.show_labels) {
@@ -3139,8 +3298,9 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
           const nm = (() => {
             if (!numbersOnly) return rawNm;
             const s = rawNm;
-            const last = s.includes("/") ? s.split("/").pop() : s;
-            return /^[0-9]+$/.test(last || "") ? last : s;
+            // Numbers-only labels: always use the right-most trailing digits (e.g. "2.5G 12" -> "12", "Gi1/0/47" -> "47")
+            const m = s.match(/(\d+)\s*$/);
+            return m ? m[1] : s;
           })();
           // Make the background as tight as practical while staying readable.
           // SVG text is proportional; this is an estimate, not a measurement.
@@ -3148,12 +3308,26 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
           const padY = 1.4;
           const estW = Math.max(6, (nm.length * fs * 0.48) + (padX * 2));
           const rectX = (x + Ps / 2) - (estW / 2);
-          const rectY = y + Ps + 2;
           const rectH = fs + (padY * 2);
+          let pos = (this._config.label_position || "below");
+          if (pos === "split") {
+            // Split (2 row): top row labels above, bottom row labels below.
+            // Use actual Y midpoint so we split by rendered rows even with non-standard perRow.
+            pos = (_splitMidY != null && y <= _splitMidY) ? "above" : "below";
+          }
+          // Labels are overlay-only. We keep them inside the existing SVG bounds so they do not
+          // change panel height (unless the user explicitly makes the panel smaller than labels).
+          const desiredY = (pos === "above")
+            ? (y - rectH - 2)
+            : (pos === "inside")
+              ? (y + (Ps - rectH) / 2)
+              : (y + Ps + 2);
+          const rectY = Math.min(Math.max(desiredY, 2), Math.max(2, H - rectH - 2));
+
           const textY = rectY + fs + padY - 0.5;
           const bg = String(labelBg || "").trim();
-          const bgRect = bg ? `<rect x="${rectX}" y="${rectY}" width="${estW}" height="${rectH}" rx="2" ry="2" fill="${bg}" style="pointer-events:none"></rect>` : "";
-          labels.push(`${bgRect}<text class="portlabel" x="${x + Ps / 2}" y="${textY}" text-anchor="middle" dominant-baseline="alphabetic" style="pointer-events:none; fill:${labelColor};" fill="${labelColor}">${nm}</text>`);
+          const bgRect = bg ? `<rect class="portlabel-bg" data-entity="${id}" x="${rectX}" y="${rectY}" width="${estW}" height="${rectH}" rx="2" ry="2" fill="${bg}" style="pointer-events:none"></rect>` : "";
+          labels.push(`${bgRect}<text class="portlabel" data-entity="${id}" x="${x + Ps / 2}" y="${textY}" text-anchor="middle" dominant-baseline="alphabetic" style="${(this._config.label_numbers_only && this._config.label_outline) ? 'paint-order:stroke fill;stroke:#000;stroke-width:2px;stroke-linejoin:round;' : ''} pointer-events:none; fill:${labelColor};" fill="${labelColor}">${nm}</text>`);
         }
         const titleParts = [];
         if (alias) titleParts.push(`${alias}`);
@@ -3167,11 +3341,14 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
             </g>`;
       }).join("");
 
+      // Expand viewBox height if custom positions extend beyond the default grid.
+      H = Math.max(H, Math.ceil(maxBottom));
+
       const svg = `
         <div class="panel-wrap${useBg ? " bg" : ""}"${useBg ? ` style="background-image:url(${bgUrl})"` : ""}>
           <svg data-ssm-panel="1" viewBox="0 0 ${W} ${H}" width="100%" height="auto" preserveAspectRatio="xMidYMid meet">
 
-            ${this._config.calibration_mode ? `
+            ${this._isCalibrationEnabled() ? `
               <!-- Background hit-target must be BEHIND ports so port dragging/selection works -->
               <rect id="ssm-calib-hit" x="0" y="0" width="${W}" height="${H}" fill="rgba(0,0,0,0.001)" style="pointer-events:all"></rect>
             ` : ``}
@@ -3181,7 +3358,7 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
             <g id="ssm-label-layer" style="pointer-events:none">
               ${labels.join("")}
             </g>
-            ${this._config.calibration_mode ? `
+            ${this._isCalibrationEnabled() ? `
               <g id="ssm-calib-layer" style="pointer-events:none"><rect id="ssm-calib-marquee" x="0" y="0" width="0" height="0" fill="rgba(0,150,255,.15)" stroke="rgba(0,150,255,.6)" stroke-width="1" style="display:none"></rect>
                 <line id="ssm-calib-cross-v" x1="0" y1="0" x2="0" y2="${H}" stroke="rgba(255,255,255,.35)" stroke-width="1"></line>
                 <line id="ssm-calib-cross-h" x1="0" y1="0" x2="${W}" y2="0" stroke="rgba(255,255,255,.35)" stroke-width="1"></line>
@@ -3225,7 +3402,7 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
       return `
         ${this._config.info_position === "above" ? infoGrid : ""}
         <div class="panel">${svg}</div>
-        ${this._config.calibration_mode ? `
+        ${this._isCalibrationEnabled() ? `
           <div class="calib-tools">
             <div class="calib-row">
               <div class="calib-title">Layout Editor</div>
@@ -3237,7 +3414,7 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
             </div>
 
             <div class="calib-hint">
-              Drag ports to reposition • Shift-click to multi-select • Drag empty space to box-select.
+              Drag ports to reposition • Ctrl-click to multi-select • Drag empty space to box-select.
               Use Align/Distribute for clean rows/columns. Click Save to persist locally.
             </div>
 
@@ -3250,15 +3427,10 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
               <button class="iconbtn" id="ssm-calib-portsbox" type="button" title="Ports"><ha-icon icon="mdi:ethernet"></ha-icon></button>
               ${this._config.show_uplinks_separately ? `<button class="iconbtn" id="ssm-calib-uplinkbox" type="button" title="Uplinks"><ha-icon icon="mdi:arrow-up-bold"></ha-icon></button>` : ``}
 
-              <label class="calib-inline">
-                Snap
-                <select id="ssm-calib-snap">
-                  <option value="0">Off</option>
-                  <option value="2">2px</option>
-                  <option value="5">5px</option>
-                  <option value="10">10px</option>
-                </select>
-              </label>
+<label class="calib-inline">
+  Snap (px)
+  <input id="ssm-calib-snap" class="calib-snap-input" type="number" inputmode="numeric" min="0" step="1" title="0 = Off" />
+</label>
 
               <label class="calib-inline" id="ssm-calib-order-wrap" style="display:none">
                 Order
@@ -3366,7 +3538,7 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
         ev.stopPropagation();
         const id = g.getAttribute("data-entity");
         if (!id) return;
-        if (this._config?.calibration_mode) return; // handled by calibration helper
+        if (this._isCalibrationEnabled()) return; // handled by calibration helper
         if ((this._config?.color_mode || "state") === "speed" && this._config?.speed_click_opens_graph) {
           if (this._maybeOpenBandwidthGraphForPort(id)) return;
         }
@@ -3377,7 +3549,7 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
           ev.preventDefault();
           const id = g.getAttribute("data-entity");
           if (!id) return;
-          if (this._config?.calibration_mode) return; // handled by calibration helper
+          if (this._isCalibrationEnabled()) return; // handled by calibration helper
           this._openDialog(id);
         }
       });
@@ -3478,18 +3650,65 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
         this._onSsmCalibrationClosed = (ev) => {
           const d = ev && ev.detail ? ev.detail : {};
           if (d.device && this._config?.device && (d.device || "") !== (this._config?.device || "")) return;
-          if (!this._config?.calibration_mode) return;
+          if (!this._isCalibrationEnabled()) return;
           this._updateConfig("calibration_mode", false);
         };
 
       }
 
 
-      connectedCallback() {
+      
+      _setupAutoScale() {
+        // Responsive scale for large displays (e.g., 4K). Defaults ON unless explicitly disabled.
+        if (this._ssmResizeObs) return;
+        const run = () => this._applyAutoScale();
+        // Use ResizeObserver to react to layout changes without polling
+        try {
+          this._ssmResizeObs = new ResizeObserver(() => {
+            if (this._ssmScaleRaf) cancelAnimationFrame(this._ssmScaleRaf);
+            this._ssmScaleRaf = requestAnimationFrame(run);
+          });
+          this._ssmResizeObs.observe(this);
+        } catch (e) {
+          // Fallback: window resize
+          window.addEventListener("resize", run);
+          this._ssmResizeFallback = run;
+        }
+      }
+
+      _applyAutoScale() {
+        if (!this.shadowRoot) return;
+        if (this._config && this._config.auto_scale === false) return;
+
+        const outer = this.shadowRoot.querySelector(".autoscale-outer");
+        const inner = this.shadowRoot.querySelector(".autoscale-inner");
+        if (!outer || !inner) return;
+
+        // Ensure we measure unscaled content
+        inner.style.transform = "scale(1)";
+        outer.style.height = "auto";
+
+        const availW = outer.getBoundingClientRect().width;
+        const contentW = inner.scrollWidth;
+        const contentH = inner.scrollHeight;
+
+        if (!availW || !contentW) return;
+
+        // Allow upscaling on large displays; cap to avoid absurd zoom.
+        const maxScale = 2.5;
+        let s = availW / contentW;
+        if (!Number.isFinite(s) || s <= 0) s = 1;
+        if (s > maxScale) s = maxScale;
+
+        inner.style.transform = `scale(${s})`;
+        outer.style.height = `${Math.ceil(contentH * s)}px`;
+      }
+connectedCallback() {
         if (this._ssmPosListenerAdded) return;
         this._ssmPosListenerAdded = true;
         window.addEventListener("ssm-port-positions-saved", this._onSsmPositionsSaved);
         window.addEventListener("ssm-calibration-closed", this._onSsmCalibrationClosed);
+        this._setupAutoScale();
       }
 
       disconnectedCallback() {
@@ -3497,6 +3716,10 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
         this._ssmPosListenerAdded = false;
         window.removeEventListener("ssm-port-positions-saved", this._onSsmPositionsSaved);
         window.removeEventListener("ssm-calibration-closed", this._onSsmCalibrationClosed);
+        if (this._ssmResizeObs) {
+          try { this._ssmResizeObs.disconnect(); } catch (e) {}
+          this._ssmResizeObs = null;
+        }
       }
 
       _defaultSpeedPalette() {
@@ -3561,7 +3784,7 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
       _speedLabelFromAttrs(attrs) {
         if (!attrs) return null;
         const candidates = [
-          attrs.SpeedLabel, attrs.speed_label, attrs.speedLabel, attrs.speedText, attrs.speed_text,
+          attrs.SpeedLabel, attrs.speed_label, attrs.speedLabel, attrs.speedText, attrs.speed_text, attrs.SpeedDisplay, attrs.speed_display, attrs.speedDisplay,
           attrs.LinkSpeedLabel, attrs.link_speed_label, attrs.LinkSpeedText, attrs.link_speed_text,
           attrs.PortSpeedLabel, attrs.port_speed_label,
           attrs.Speed, attrs.speed, attrs.PortSpeed, attrs.port_speed, attrs.link_speed, attrs.LinkSpeed,
@@ -3584,41 +3807,48 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
         return null;
       }
 
-      _detectedSpeedLabels(devicePrefix) {
-        const hass = this._hass;
-        const labels = new Set();
+_detectedSpeedLabels(devicePrefix) {
+  const hass = this._hass;
+  const labels = new Set();
 
-        // Prefer cached per-prefix port entity_ids. We intentionally do NOT scan hass.states
-        // because iterating the full registry can lock up the browser on large installs.
-        const cached = this._portEidsByPrefix instanceof Map
-          ? (this._portEidsByPrefix.get(String(devicePrefix || "")) || null)
-          : null;
+  const map = (this._portEidsByPrefix instanceof Map) ? this._portEidsByPrefix : null;
+  if (!map || !hass?.states) return [];
 
-        if (Array.isArray(cached) && cached.length && hass?.states) {
-          for (const eid of cached) {
-            const st = hass.states[eid];
-            if (!st) continue;
-            const label = this._speedLabelFromAttrs(st?.attributes) || null;
-            if (label) labels.add(label);
-          }
-        }
+  const prefix = String(devicePrefix || "");
+  const wantAll = !prefix || prefix === "all";
 
-        // Always include Unknown so users can set it if they want.
-        labels.add("Unknown");
+  const addFromList = (list) => {
+    if (!Array.isArray(list) || !list.length) return;
+    for (const eid of list) {
+      const st = hass.states[eid];
+      if (!st) continue;
+      const label = this._speedLabelFromAttrs(st?.attributes) || null;
+      if (label) labels.add(label);
+    }
+  };
 
-        // Sort numerically by Mbps
-        const toMbps = (lab) => {
-          if (lab === "Unknown") return Number.POSITIVE_INFINITY;
-          const m = String(lab).toLowerCase().match(/^([0-9]+(?:\.[0-9]+)?)\s*(m|g)bps$/);
-          if (!m) return Number.POSITIVE_INFINITY - 1;
-          const v = parseFloat(m[1]);
-          const unit = m[2];
-          return unit === "g" ? v * 1000 : v;
-        };
-        return Array.from(labels).sort((a, b) => toMbps(a) - toMbps(b));
-      }
+  if (wantAll) {
+    for (const list of map.values()) addFromList(list);
+  } else {
+    addFromList(map.get(prefix) || null);
+  }
 
-      _renderStateColorsSection(c) {
+  // Sort ascending by Mbps
+  const toMbps = (lab) => {
+    if (typeof lab === "number") return lab;
+    if (lab === "Disconnected") return -1;
+    const s = String(lab);
+    const m = s.match(/^([0-9]+(?:\.[0-9]+)?)\s*(M|G)bps$/i);
+    if (!m) return Number.POSITIVE_INFINITY;
+    const v = parseFloat(m[1]);
+    const unit = m[2].toLowerCase();
+    return unit === "g" ? v * 1000 : v;
+  };
+    labels.add("Disconnected");
+  return Array.from(labels).sort((a, b) => toMbps(a) - toMbps(b));
+}
+
+  _renderStateColorsSection(c) {
         const palette = this._defaultStatePalette();
         const overrides = (c.state_colors && typeof c.state_colors === "object") ? c.state_colors : {};
         const keys = ["up_up", "up_down", "down_down", "up_not_present"];
@@ -3663,9 +3893,13 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
         const labels = this._detectedSpeedLabels(c.device);
 
         const items = labels.map((lab) => {
-          const val = (typeof overrides[lab] === "string" && overrides[lab].trim())
+          const o = (typeof overrides[lab] === "string" && overrides[lab].trim())
             ? overrides[lab].trim()
-            : (palette[lab] || palette["Unknown"]);
+            : null;
+          const o2 = (lab === "Disconnected" && typeof overrides["Unknown"] === "string" && overrides["Unknown"].trim())
+            ? overrides["Unknown"].trim()
+            : null;
+          const val = o || o2 || (palette[lab] || palette["Disconnected"] || palette["Unknown"] || "#ef4444");
           return `
             <div class="colorItem">
               <div class="colorTitle">${this._escape(lab)}</div>
@@ -3687,7 +3921,7 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
                 <ha-icon icon="mdi:restore"></ha-icon>
               </button>
             </div>
-            <div class="hint">Colors are based on the switch's normalized speed labels. Only speeds detected on the selected device are shown.</div>
+            <div class="hint">Colors are based on the switch's normalized speed labels. Only speeds detected on the selected device are shown (or across all devices when none is selected).</div>
             <div class="colorGrid">${items}</div>
           </div>
         `;
@@ -3702,7 +3936,7 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
         const rows = labels.map((lab) => {
           const val = (typeof overrides[lab] === "string" && overrides[lab].trim())
             ? overrides[lab].trim()
-            : (palette[lab] || palette["Unknown"]);
+            : (palette[lab] || palette["Disconnected"]);
           return `
             <div class="speedrow">
               <div class="speedlabel">${this._escape(lab)}</div>
@@ -3717,7 +3951,7 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
         return `
           <div class="row">
             <label>Speed colors</label>
-            <div class="hint">Colors are based on the switch's normalized speed labels. Only speeds detected on the selected device are shown.</div>
+            <div class="hint">Colors are based on the switch's normalized speed labels. Only speeds detected on the selected device are shown (or across all devices when none is selected).</div>
             <div class="speedgrid">${rows}</div>
             <div class="row inline">
               <button id="speed_reset" class="btn" type="button"${hasOverrides ? "" : " disabled"}>Reset to defaults</button>
@@ -3778,9 +4012,8 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
 // IMPORTANT: do NOT clear the flag until the config actually has calibration_mode=false saved,
 // otherwise "Cancel" in the HA editor would resurrect the old YAML value.
 try {
-  const prefix = (this._config?.device || "") ? String(this._config.device) : "unknown";
-  const bg = String(this._config?.background_image || "");
-  const k = `ssm_calib_force_off:${prefix}:${bg}`;
+  const prefix = (this._config?.device || "") ? String(this._config.device) : "all";
+  const k = `ssm_calib_force_off:${prefix}`;
   const ts = localStorage.getItem(k);
 
   // If we already see calibration_mode=false coming from YAML, clear the one-shot flag.
@@ -4361,18 +4594,33 @@ details.section > summary::after{
 
                 ` : ""}${c.view === "panel" ? `
 
-                <div class="row inline">
-                  <label for="show_labels">Show labels under ports</label>
-                  <ha-switch id="show_labels" ${c.show_labels !== false ? " checked" : ""}${c.view === "list" ? " disabled" : ""}></ha-switch>
-                </div>
-
-                ` : ""}${c.view === "panel" ? `
+                <div class="row inline" style="gap:10px; align-items:center;">
+  <label for="show_labels" style="flex:1 1 auto;">Show port labels</label>
+  <select id="label_position" style="width:160px; margin-right:6px;"
+    ${c.show_labels === false || c.view === "list" ? " disabled" : ""}>
+    <option value="below"${(c.label_position || "below") === "below" ? " selected" : ""}>Below</option>
+    <option value="above"${(c.label_position || "below") === "above" ? " selected" : ""}>Above</option>
+    <option value="inside"${(c.label_position || "below") === "inside" ? " selected" : ""}>Inside</option>
+    <option value="split"${(c.label_position || "below") === "split" ? " selected" : ""}>Split (2 row)</option>
+  </select>
+  <div class="helpiconbtn" data-help-title="Label position" data-help="label_position"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div>
+  <ha-switch id="show_labels" ${c.show_labels !== false ? "checked" : ""}${c.view === "list" ? " disabled" : ""}></ha-switch>
+</div>
+` : ""}${c.view === "panel" ? `
 <div class="row inline">
                   <label for="label_numbers_only">Labels: numbers only</label>
                   <ha-switch id="label_numbers_only" ${c.label_numbers_only ? " checked" : ""}${c.show_labels === false || c.view === "list" ? " disabled" : ""}></ha-switch>
                 </div>
 
-                ` : ""}${c.view === "panel" ? `
+                
+<div class="row inline">
+  <label for="label_outline">Outline port numbers</label>
+	  <ha-switch id="label_outline"${c.label_outline ? " checked" : ""}${c.show_labels === false || c.view === "list" || c.label_numbers_only !== true ? " disabled" : ""}></ha-switch>
+  <div class="helpiconbtn" data-help-title="Outline port numbers" data-help="label_outline">
+    <ha-icon icon="mdi:help-circle-outline"></ha-icon>
+  </div>
+</div>
+` : ""}${c.view === "panel" ? `
 <div class="row">
                   <label for="label_size">Label font size</label>
                   <input id="label_size" type="number" min="1" value="${c.label_size != null ? Number(c.label_size) : 8}"${c.view === "list" ? " disabled" : ""}>
@@ -4461,6 +4709,11 @@ ${c.view === "panel" ? `
                 <div class="row inline">
                   <label for="show_virtual_interfaces">Show Virtual Interfaces</label><div class="helpiconbtn" icon="mdi:help-circle-outline" data-help-title="Show Virtual Interfaces" data-help="show_virtual"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div>
                   <ha-switch id="show_virtual_interfaces" ${c.hide_virtual_interfaces ? "" : " checked"}></ha-switch>
+                </div>
+
+                <div class="row inline">
+                  <label for="hide_control_buttons">Hide control buttons</label><div class="helpiconbtn" icon="mdi:help-circle-outline" data-help-title="Hide control buttons" data-help="hide_controls"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div>
+                  <ha-switch id="hide_control_buttons" ${c.hide_control_buttons ? " checked" : ""}></ha-switch>
                 </div>
 
                 ${c.hide_virtual_interfaces ? "" : `
@@ -4646,7 +4899,8 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
         const speedPalette = this._defaultSpeedPalette();
         const statePalette = this._defaultStatePalette();
 
-        const updateSpeedColor = (label, color) => {
+        
+const updateSpeedColor = (label, color) => {
           const lab = String(label || "").trim() || "Unknown";
           const cval = String(color || "").trim();
           if (!/^#[0-9a-fA-F]{6}$/.test(cval)) return;
@@ -4654,12 +4908,27 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
           const cur = (this._config?.speed_colors && typeof this._config.speed_colors === "object")
             ? { ...this._config.speed_colors }
             : {};
-          const def = speedPalette[lab] || speedPalette["Unknown"];
-          if (cval.toLowerCase() === String(def).toLowerCase()) delete cur[lab];
-          else cur[lab] = cval;
+          const def = speedPalette[lab] || speedPalette["Disconnected"] || speedPalette["Unknown"];
+
+          const isDefault = (String(def || "").toLowerCase() === cval.toLowerCase());
+
+          if (lab === "Disconnected") {
+            if (isDefault) {
+              delete cur["Disconnected"];
+              delete cur["Unknown"];
+            } else {
+              cur["Disconnected"] = cval;
+              cur["Unknown"] = cval;
+            }
+          } else {
+            if (isDefault) delete cur[lab];
+            else cur[lab] = cval;
+          }
 
           this._updateConfig("speed_colors", Object.keys(cur).length ? cur : null);
         };
+
+        
 
         const updateStateColor = (key, color) => {
           const k = String(key || "").trim();
@@ -4782,7 +5051,12 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
 
         root.getElementById("calibration_mode")?.addEventListener("change", (ev) => {
           this._updateConfig("calibration_mode", !!ev.target.checked);
-        });
+        
+          try {
+            const prefix = (this._config?.device || "") ? String(this._config.device) : "all";
+            localStorage.removeItem(`ssm_calib_force_off:${prefix}`);
+          } catch (e) {}
+});
 
 
         // Content toggles
@@ -4795,6 +5069,11 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
 
         root.getElementById("show_virtual_interfaces")?.addEventListener("change", (ev) => {
           this._updateConfig("hide_virtual_interfaces", !ev.target.checked);
+          this._render();
+        });
+
+        root.getElementById("hide_control_buttons")?.addEventListener("change", (ev) => {
+          this._updateConfig("hide_control_buttons", !!ev.target.checked);
           this._render();
         });
 
@@ -4812,8 +5091,20 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
         root.getElementById("label_numbers_only")?.addEventListener("change", (ev) => {
           this._updateConfig("label_numbers_only", !!ev.target.checked);
         });
+// Outline port numbers (only used when "Port labels by number" is enabled)
+root.getElementById("label_outline")?.addEventListener("change", (ev) => {
+  this._updateConfig("label_outline", ev.target.checked === true);
+});
 
-// Label size
+
+// Label position
+        root.getElementById("label_position")?.addEventListener("change", (ev) => {
+          const v = String(ev.target.value || "below");
+          const ok = (v === "below" || v === "above" || v === "inside" || v === "split");
+          this._updateConfig("label_position", ok ? v : "below");
+        });
+
+        // Label size
         root.getElementById("label_size")?.addEventListener("change", (ev) => {
           const v = parseInt(ev.target.value, 10);
           this._updateConfig("label_size", Number.isFinite(v) ? v : 8);
@@ -5069,6 +5360,7 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
           }
         }
 
+        requestAnimationFrame(() => this._applyAutoScale());
         this._rendered = true;
       }
     
@@ -5095,6 +5387,10 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
   show_virtual: {
     title: "Show Virtual Interfaces",
     text: "Show or hide the Virtual Interfaces panel. Classification still uses the override list even if the panel is hidden."
+  },
+  hide_controls: {
+    title: "Hide control buttons",
+    text: "Hides the Turn on/Turn off buttons in the card (Virtual Interfaces list + port popup). Useful if you want to avoid accidentally toggling ports from the UI."
   },
   show_uplinks_separately: {
     title: "Show uplinks separately in layout",
@@ -5149,10 +5445,20 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
     title: "Label background color",
     text: "Optional background behind port labels (Panel view) to improve contrast. Use Clear to remove and return to the default."
   },
+  label_position: {
+    title: "Label position",
+    text: "Choose where the port labels render relative to the port squares. Below = under the port. Above = over the port. Inside = centered inside the port. Split (2 row) = top row labels above and bottom row labels below."
+  },
+
   speed_click_opens_graph: {
     title: "Open traffic graph on port click",
     text: "Only applies when Port colors is set to Speed. When enabled, clicking a port opens the bandwidth traffic graph (if bandwidth sensors exist for that port). If no bandwidth sensors are found, the normal port information popup is shown instead."
   },
+
+label_outline: {
+  title: "Outline port numbers",
+  text: "Adds a black outline around numeric port labels to improve readability on bright backgrounds. This only applies when \"Port labels by number\" is enabled."
+},
 };
 
 const _ensureHelpPopover = (container) => {
