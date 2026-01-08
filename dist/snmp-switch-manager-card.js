@@ -390,7 +390,6 @@ _setLayoutEditorSessionClosed() {
     return ent ? ent.split("_")[0] : "";
   }
 
-
   _getDiagnosticsEntityIds() {
     const H = this._hass?.states || {};
     const prefix = this._inferDevicePrefix();
@@ -403,13 +402,16 @@ _setLayoutEditorSessionClosed() {
       firmware_revision: "firmware_revision",
     };
 
-    const order = (Array.isArray(this._config?.diagnostics_order) && this._config.diagnostics_order.length)
+    const rawOrder = (Array.isArray(this._config?.diagnostics_order) && this._config.diagnostics_order.length)
       ? this._config.diagnostics_order
       : builtin;
 
     const enabledMap = (this._config?.diagnostics_enabled && typeof this._config.diagnostics_enabled === "object")
       ? this._config.diagnostics_enabled
       : {};
+
+    // Inject Environment/PoE defaults when the underlying data exists.
+    const order = this._injectAutoDiagDefaults(rawOrder, enabledMap);
 
     const out = [];
     for (const raw of order) {
@@ -419,11 +421,21 @@ _setLayoutEditorSessionClosed() {
       // Skip disabled
       if (enabledMap[key] === false) continue;
 
+      // Attribute-backed diagnostic: "sensor.x#Attribute Name"
+      if (key.includes("#") && key.includes(".")) {
+        const [eid, attr] = key.split("#");
+        const st = H[eid];
+        const v = st?.attributes?.[attr];
+        if (st && v != null) out.push(key);
+        continue;
+      }
+
       // Custom entity_id (e.g. sensor.some_sensor)
       if (key.includes(".")) {
         if (H[key]) out.push(key);
         continue;
       }
+
 
       // Built-in key (with aliases)
       const mapped = aliasToBuiltin[key] || key;
@@ -443,6 +455,84 @@ _setLayoutEditorSessionClosed() {
     const cand = prefix.replace(/_/g, "-").toUpperCase();
     const re = new RegExp("^" + cand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s+", "i");
     return name.replace(re, "");
+  }
+
+
+  _autoDefaultDiagKeys(prefix, H) {
+    // Return a list of *resolved* diagnostic keys (entity_id or "entity_id#Attribute Name")
+    // in the desired order, but only when the underlying data exists.
+    const out = [];
+
+    const envAgg = `sensor.${prefix}_environment`;
+    const poeAgg = `sensor.${prefix}_power_over_ethernet`;
+
+    // Environment: System Temperature (°C)
+    const envTemp = `sensor.${prefix}_system_temperature`;
+    if (H[envTemp]) out.push(envTemp);
+    else {
+      const st = H[envAgg];
+      const v = st?.attributes?.["System Temperature (°C)"];
+      if (v != null) out.push(`${envAgg}#System Temperature (°C)`);
+    }
+
+    // Environment: System Temperature Status
+    const envStatus = `sensor.${prefix}_system_temperature_status`;
+    if (H[envStatus]) out.push(envStatus);
+    else {
+      const st = H[envAgg];
+      const v = st?.attributes?.["System Temperature Status"];
+      if (v != null) out.push(`${envAgg}#System Temperature Status`);
+    }
+
+    // PoE: Power Used (W)
+    const poeUsed = `sensor.${prefix}_poe_power_used`;
+    if (H[poeUsed]) out.push(poeUsed);
+    else {
+      const st = H[poeAgg];
+      const v = st?.attributes?.["PoE Power Used (W)"];
+      if (v != null) out.push(`${poeAgg}#PoE Power Used (W)`);
+      else if (st) out.push(poeAgg); // fallback (state = used W)
+    }
+
+    // PoE: Power Available (W)  (remaining budget)
+    const poeAvail = `sensor.${prefix}_poe_power_available`;
+    if (H[poeAvail]) out.push(poeAvail);
+    else {
+      const st = H[poeAgg];
+      const v = st?.attributes?.["PoE Power Available (W)"];
+      if (v != null) out.push(`${poeAgg}#PoE Power Available (W)`);
+    }
+
+    return out;
+  }
+
+  _isAutoDefaultDiagKey(key) {
+    // Used to remember when users remove an auto-default row so it doesn't come back.
+    const k = String(key || "");
+    return (
+      /_system_temperature(_status)?$/.test(k) ||
+      /_poe_power_(used|available)$/.test(k) ||
+      /_environment#System Temperature/.test(k) ||
+      /_power_over_ethernet#PoE Power (Used|Available)/.test(k) ||
+      /_power_over_ethernet$/.test(k)
+    );
+  }
+
+  _injectAutoDiagDefaults(order, enabledMap) {
+    const H = this._hass?.states || {};
+    const prefix = this._inferDevicePrefix();
+    if (!prefix) return order;
+
+    const defaults = this._autoDefaultDiagKeys(prefix, H);
+    if (!defaults.length) return order;
+
+    const out = Array.isArray(order) ? [...order] : [];
+    for (const k of defaults) {
+      // If user explicitly disabled/removed this key, don't re-add it.
+      if (enabledMap && enabledMap[k] === false) continue;
+      if (!out.includes(k)) out.push(k);
+    }
+    return out;
   }
 
   _entityMatchesNameUnitSlot(id, st) {
@@ -3190,6 +3280,18 @@ if (boxSelecting && boxStart) {
         if (!diagIds.length) return "";
         const H = this._hass?.states || {};
         const rows = diagIds.map(id => {
+          // Attribute-backed diagnostic: "sensor.x#Attribute Name"
+          if (String(id).includes("#")) {
+            const [eid, attr] = String(id).split("#");
+            const st = H[eid];
+            if (!st) return null;
+            const v = st?.attributes?.[attr];
+            if (v == null) return null;
+            const name = attr; // already human-readable (comes from integration attribute names)
+            const value = (typeof v === "string") ? v : (Number.isFinite(v) ? String(v) : JSON.stringify(v));
+            return `<div class="diag-row"><span class="diag-name">${name}</span><span class="diag-val">${value}</span></div>`;
+          }
+
           const st = H[id]; if (!st) return null;
           let name = st.attributes?.friendly_name || id;
           // Friendly names often include the device prefix (e.g. "SWITCH-XYZ Hostname"); strip it for display.
@@ -3798,6 +3900,91 @@ if (!customElements.get("snmp-switch-manager-card-editor")) {
           this._updateConfig("calibration_mode", false);
         };
 
+      }
+
+      // ---- Diagnostics auto-default helpers (Editor) ----
+      // The live card injects conservative Environment/PoE defaults into the Diagnostics list
+      // when the underlying sensors/attributes exist. The editor must mirror that logic so the
+      // visual editor doesn't crash and the displayed Diagnostics order matches the live card.
+
+      _inferDevicePrefix() {
+        const cfg = this._config || {};
+        if (cfg.device) return String(cfg.device);
+        const ae = cfg.anchor_entity ? String(cfg.anchor_entity) : "";
+        const ent = ae.includes(".") ? ae.split(".")[1] : "";
+        const m = ent.match(/^(.+?)_(gi|fa|ge|te|tw|xe|et|eth|po|vlan|slot)\d/i);
+        if (m) return m[1];
+        return ent ? ent.split("_")[0] : "";
+      }
+
+      _autoDefaultDiagKeys(prefix, H) {
+        // Prefer Sensors-mode entities when present; otherwise fall back to Attributes-mode
+        // aggregate sensors (Environment + Power over Ethernet) and read specific attributes.
+        const out = [];
+
+        // Environment
+        const envTemp = `sensor.${prefix}_system_temperature`;
+        const envTempStatus = `sensor.${prefix}_system_temperature_status`;
+        const envAgg = `sensor.${prefix}_environment`;
+        if (H[envTemp]) out.push(envTemp);
+        else {
+          const st = H[envAgg];
+          const v = st?.attributes?.["System Temperature (°C)"];
+          if (v != null) out.push(`${envAgg}#System Temperature (°C)`);
+        }
+        if (H[envTempStatus]) out.push(envTempStatus);
+        else {
+          const st = H[envAgg];
+          const v = st?.attributes?.["System Temperature Status"];
+          if (v != null) out.push(`${envAgg}#System Temperature Status`);
+        }
+
+        // PoE
+        const poeUsed = `sensor.${prefix}_poe_power_used`;
+        const poeAvail = `sensor.${prefix}_poe_power_available`;
+        const poeAgg = `sensor.${prefix}_power_over_ethernet`;
+        if (H[poeUsed]) out.push(poeUsed);
+        else {
+          const st = H[poeAgg];
+          const v = st?.attributes?.["PoE Power Used (W)"];
+          if (v != null) out.push(`${poeAgg}#PoE Power Used (W)`);
+          else if (st) out.push(poeAgg); // last resort: show aggregate sensor state
+        }
+        if (H[poeAvail]) out.push(poeAvail);
+        else {
+          const st = H[poeAgg];
+          const v = st?.attributes?.["PoE Power Available (W)"];
+          if (v != null) out.push(`${poeAgg}#PoE Power Available (W)`);
+        }
+
+        return out;
+      }
+
+      _isAutoDefaultDiagKey(key) {
+        const k = String(key || "");
+        return (
+          /_system_temperature(_status)?$/.test(k) ||
+          /_poe_power_(used|available)$/.test(k) ||
+          /_environment#System Temperature/.test(k) ||
+          /_power_over_ethernet#PoE Power (Used|Available)/.test(k) ||
+          /_power_over_ethernet$/.test(k)
+        );
+      }
+
+      _injectAutoDiagDefaults(order, enabledMap) {
+        const H = this._hass?.states || {};
+        const prefix = this._inferDevicePrefix();
+        if (!prefix) return order;
+
+        const defaults = this._autoDefaultDiagKeys(prefix, H);
+        if (!defaults.length) return order;
+
+        const out = Array.isArray(order) ? [...order] : [];
+        for (const k of defaults) {
+          if (enabledMap && enabledMap[k] === false) continue; // respect user removal/disable
+          if (!out.includes(k)) out.push(k);
+        }
+        return out;
       }
 
 
@@ -4834,10 +5021,11 @@ ${c.view === "panel" ? `
                     <div class="rowhead"><label>Diagnostics order</label><div class="helpiconbtn" icon="mdi:help-circle-outline" data-help-title="Diagnostics order" data-help="diagnostics_order"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
                     <div class="diaglist">
                       ${(() => {
-                        const order = Array.isArray(c.diagnostics_order) && c.diagnostics_order.length
+                        const rawOrder = Array.isArray(c.diagnostics_order) && c.diagnostics_order.length
                           ? c.diagnostics_order
                           : ["hostname","manufacturer","model","firmware_revision","uptime"];
                         const enabledMap = (c.diagnostics_enabled && typeof c.diagnostics_enabled === "object") ? c.diagnostics_enabled : {};
+                        const order = this._injectAutoDiagDefaults(rawOrder, enabledMap);
                         return order.map((key, idx) => {
                           const enabled = enabledMap[key] !== false;
                           const label = this._diagnosticLabel(key);
@@ -5517,7 +5705,8 @@ root.getElementById("label_outline")?.addEventListener("change", (ev) => {
               const order = getDiagOrder().filter((x) => x !== key);
               setDiagOrder(order);
               const m = getEnabledMap();
-              delete m[key];
+              if (this._isAutoDefaultDiagKey(key)) m[key] = false;
+              else delete m[key];
               setEnabledMap(m);
               this._render();
               ev.stopPropagation();
