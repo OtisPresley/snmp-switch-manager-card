@@ -46,9 +46,26 @@ function _ssmNormalizeConfig(config) {
   // Shallow clone to avoid accidental external mutation.
   const out = { ...config };
 
+// Port gap: canonical keys (preferred). Older keys are mapped once for backward compatibility.
+// Official keys: horizontal_port_gap, vertical_port_gap
+const hasH = out.horizontal_port_gap != null && out.horizontal_port_gap !== "";
+const hasV = out.vertical_port_gap != null && out.vertical_port_gap !== "";
+if (!hasH || !hasV) {
+  // Backward compat sources (deprecated): port_gap_x/y, gap_x/y, gap
+  const legacyH = (out.port_gap_x ?? out.gap_x ?? out.gap);
+  const legacyV = (out.port_gap_y ?? out.gap_y ?? out.gap);
+  if (!hasH && legacyH != null && legacyH !== "") out.horizontal_port_gap = legacyH;
+  if (!hasV && legacyV != null && legacyV !== "") out.vertical_port_gap = legacyV;
+}
+
   // Drop deprecated / renamed keys to keep saved YAML clean.
   // Keep this list explicit (do not strip unknown future keys).
   const deprecatedKeys = [
+    "port_gap_y",
+    "port_gap_x",
+    "gap_y",
+    "gap_x",
+    "gap",
     "show_uplinks_separately_in_layout", // old/typo key
   ];
   for (const k of deprecatedKeys) {
@@ -179,9 +196,11 @@ _setLayoutEditorSessionClosed() {
       panel_width: Number.isFinite(config.panel_width) ? Number(config.panel_width) : 740,
       // Port size is now controlled via Port scale + Layout Editor; keep internal base size.
       port_size: 18,
-      gap: Number.isFinite(config.gap) ? Number(config.gap) : 10,
+      horizontal_port_gap: Number.isFinite(Number(config.horizontal_port_gap)) ? Number(config.horizontal_port_gap) : 10,
+      vertical_port_gap: Number.isFinite(Number(config.vertical_port_gap)) ? Number(config.vertical_port_gap) : 10,
       show_labels: config.show_labels !== false,
       label_numbers_only: config.label_numbers_only === true,
+      label_numbers_from: (config.label_numbers_from === "port_name" || config.label_numbers_from === "index") ? config.label_numbers_from : "index",
       label_outline: config.label_outline === true,
       label_size: Number.isFinite(config.label_size) ? Number(config.label_size) : 8,
       label_position: (config.label_position === "above" || config.label_position === "inside" || config.label_position === "below" || config.label_position === "split")
@@ -900,6 +919,7 @@ _parseSpeedMbps(attrs) {
     this._freezeRenderWhileGraphOpen = true;
 
     // Remove any prior graph modal
+    if (this._graphAutoRefreshTimer) { clearInterval(this._graphAutoRefreshTimer); this._graphAutoRefreshTimer = null; }
     this._graphModalEl?.remove();
     this._graphModalStyle?.remove();
 
@@ -918,6 +938,17 @@ _parseSpeedMbps(attrs) {
         <div class="ssm-modal-title">${title} – Bandwidth</div>
         <div class="ssm-modal-body"><div class="ssm-graph-host">Loading…</div></div>
         <div class="ssm-modal-actions">
+          <div class="ssm-graph-refresh-wrap">
+            <span class="ssm-graph-refresh-label">Auto refresh</span>
+            <select class="ssm-graph-refresh" data-graph-auto-refresh="1">
+              <option value="0">Never</option>
+              <option value="5">5s</option>
+              <option value="10">10s</option>
+              <option value="30">30s</option>
+              <option value="60">1m</option>
+              <option value="300">5m</option>
+            </select>
+          </div>
           <button class="btn" data-refresh-graph="1">Refresh</button>
           <button class="btn subtle" data-close-graph="1">Close</button>
         </div>
@@ -940,7 +971,11 @@ _parseSpeedMbps(attrs) {
       .ssm-graph-host{min-height:260px;width:100%;}
       .ssm-graph-host > *{width:100%;}
       .ssm-graph-host > *{width:100%;}
-    `;
+    
+      .ssm-graph-refresh-wrap{display:flex;align-items:center;gap:6px;margin-right:auto;}
+      .ssm-graph-refresh-label{font-size:12px;opacity:.85;}
+      .ssm-graph-refresh{min-width:150px;max-width:180px;}
+`;
 
     // NOTE: This modal lives inside the card's shadowRoot, so its styles must also live there.
     // Appending the <style> to document.body will NOT apply to shadow DOM.
@@ -951,6 +986,7 @@ _parseSpeedMbps(attrs) {
     this._graphModalStyle = style;
 
     const close = () => {
+      if (this._graphAutoRefreshTimer) { clearInterval(this._graphAutoRefreshTimer); this._graphAutoRefreshTimer = null; }
       root.remove();
       style.remove();
       this._graphModalEl = null;
@@ -969,46 +1005,86 @@ _parseSpeedMbps(attrs) {
         this._openBandwidthGraphDialog(title, rxEntityId, txEntityId, true)
       );
     const host = root.querySelector(".ssm-graph-host");
-    // Reuse existing graph card unless explicitly refreshed
-    if (!force && this._graphCardEl) {
-      host.textContent = "";
-      host.appendChild(this._graphCardEl);
-      return;
+
+const renderGraph = async (forceRebuild = false) => {
+  // Reuse existing graph card unless explicitly refreshed
+  if (!forceRebuild && this._graphCardEl) {
+    host.textContent = "";
+    host.appendChild(this._graphCardEl);
+    return;
+  }
+  try {
+    const helpers = await window.loadCardHelpers?.();
+    if (!helpers) throw new Error("card helpers unavailable");
+    const deviceName = this._deviceDisplayNameByPrefix(this._config?.device);
+
+    const rxFriendly = this._hass?.states?.[rxEntityId]?.attributes?.friendly_name || "";
+    const txFriendly = this._hass?.states?.[txEntityId]?.attributes?.friendly_name || "";
+
+    const rxName = this._stripDevicePrefix(rxFriendly, deviceName, this._config?.device) || "RX Throughput";
+    const txName = this._stripDevicePrefix(txFriendly, deviceName, this._config?.device) || "TX Throughput";
+
+    const card = await helpers.createCardElement({
+      type: "statistics-graph",
+      chart_type: "line",
+      period: "5minute",
+      entities: [
+        { entity: rxEntityId, name: rxName },
+        { entity: txEntityId, name: txName },
+      ],
+      stat_types: ["mean", "max", "min"],
+      title: `${title} Throughput`,
+      hide_legend: false,
+      logarithmic_scale: false,
+    });
+    card.hass = this._hass;
+    host.textContent = "";
+    host.appendChild(card);
+    this._graphCardEl = card;
+  } catch (e) {
+    host.textContent = "Unable to load graph.";
+    // eslint-disable-next-line no-console
+    console.warn("SNMP Switch Manager Card: graph failed", e);
+  }
+};
+
+root
+  .querySelector('[data-refresh-graph="1"]')
+  ?.addEventListener("click", () => renderGraph(true));
+
+const selAuto = root.querySelector('[data-graph-auto-refresh="1"]');
+if (selAuto) {
+  // Load last value from localStorage (persisted per-browser)
+  const stored = Number(window.localStorage.getItem("ssm_graph_refresh_sec") || "0");
+  const last = Number.isFinite(stored) ? stored : (Number(this._graphAutoRefreshSec) || 0);
+  selAuto.value = String(Number.isFinite(last) ? last : 0);
+
+  const applyAuto = (sec) => {
+    const n = Number(sec) || 0;
+    this._graphAutoRefreshSec = n;
+    window.localStorage.setItem("ssm_graph_refresh_sec", String(n));
+    if (this._graphAutoRefreshTimer) {
+      clearInterval(this._graphAutoRefreshTimer);
+      this._graphAutoRefreshTimer = null;
     }
-    try {
-      const helpers = await window.loadCardHelpers?.();
-      if (!helpers) throw new Error("card helpers unavailable");
-      const deviceName = this._deviceDisplayNameByPrefix(this._config?.device);
-
-      const rxFriendly = this._hass?.states?.[rxEntityId]?.attributes?.friendly_name || "";
-      const txFriendly = this._hass?.states?.[txEntityId]?.attributes?.friendly_name || "";
-
-      const rxName = this._stripDevicePrefix(rxFriendly, deviceName, this._config?.device) || "RX Throughput";
-      const txName = this._stripDevicePrefix(txFriendly, deviceName, this._config?.device) || "TX Throughput";
-
-      // Use the same (built-in) Statistics Graph card config you showed.
-      const card = helpers.createCardElement({
-        type: "statistics-graph",
-        chart_type: "line",
-        period: "5minute",
-        entities: [
-          { entity: rxEntityId, name: rxName },
-          { entity: txEntityId, name: txName },
-        ],
-        stat_types: ["mean", "max", "min"],
-        title: `${title} Throughput`,
-        hide_legend: false,
-        logarithmic_scale: false,
-      });
-      card.hass = this._hass;
-      host.textContent = "";
-      host.appendChild(card);
-      this._graphCardEl = card;
-    } catch (e) {
-      host.textContent = "Unable to load graph.";
-      // eslint-disable-next-line no-console
-      console.warn("SNMP Switch Manager Card: graph failed", e);
+    if (n > 0) {
+      this._graphAutoRefreshTimer = setInterval(() => {
+        try { renderGraph(true); } catch (_) {}
+      }, n * 1000);
     }
+  };
+
+  const onAutoChanged = (ev) => {
+    const sec = Number(ev?.target?.value) || 0;
+    applyAuto(sec);
+  };
+
+  selAuto.addEventListener("change", onAutoChanged);
+  // Apply once on open so it starts immediately if previously enabled
+  applyAuto(last);
+}
+
+renderGraph(force);
   }
 
   _toggle(entity_id) {
@@ -1181,7 +1257,7 @@ _parseSpeedMbps(attrs) {
     };
 
     const rows = [];
-    const used = new Set(["name", "alias", "friendly_name", "friendly name"]);
+    const used = new Set(["name", "alias", "friendly_name", "friendly name", "icon"]);
 
     const _add = (key, label, value) => {
       if (_isBlank(value)) return;
@@ -1238,7 +1314,7 @@ _parseSpeedMbps(attrs) {
       .filter(([k, v]) => {
         // Skip some noisy/internal keys if they ever appear
         const kl = String(k).toLowerCase();
-        return !(kl === "entity_id" || kl === "device" || kl === "ports" || kl === "friendly_name" || kl === "friendly name");
+        return !(kl === "entity_id" || kl === "device" || kl === "ports" || kl === "friendly_name" || kl === "friendly name" || kl === "icon");
       })
       .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
 
@@ -2026,10 +2102,12 @@ _isCalibrationEnabled() {
         elOrder.addEventListener("change", () => {
           this._calibPortsOrder = (elOrder.value || "numeric");
           this._calibDirty = true;
-                    // Do not reflow existing port positions when changing order.
-          // Order is used by explicit layout actions (Align/Distribute) and exports.
-          if (elAdv?.style?.display !== "none") refreshExport();
-});
+          // When using the Ports box tool, changing order should immediately re-layout.
+          if (this._calibPortsBoxMode) {
+            try { applyPortsBoxLayout(); } catch (e) {}
+          }
+          refreshExport();
+        });
       }
     }
 
@@ -2186,10 +2264,51 @@ _isCalibrationEnabled() {
 
     root.getElementById("ssm-calib-clear-json")?.addEventListener("click", () => {
       showJsonErr("");
-      // Clear in-memory overrides (does NOT persist until Save is clicked)
+      // Reset positions immediately WITHOUT closing the Advanced JSON editor.
+      // We clear the in-memory overrides, then re-apply the default grid layout
+      // to the current SVG and regenerate the JSON from those new positions.
       this._calibMap = {};
-      if (elJson) elJson.value = "{}";
-      this._render();
+
+      try {
+        const gs = Array.from(root.querySelectorAll(".port-svg[data-entity]"));
+        const firstRect = gs[0]?.querySelector("rect");
+        const P = (firstRect && Number.isFinite(parseFloat(firstRect.getAttribute("width"))))
+          ? parseFloat(firstRect.getAttribute("width"))
+          : Number(this._config?.port_size || 28);
+        const Gh = Number(this._config?.horizontal_port_gap);
+        const Gv = Number(this._config?.vertical_port_gap);
+        const perRow = Math.max(1, parseInt(this._config?.ports_per_row, 10) || 24);
+        const W = Number(this._config?.panel_width || 1440);
+        const sidePad = 28;
+        const topPad = 24;
+        const usableW = W - 2 * sidePad;
+        const totalRowW = perRow * P + Math.max(0, (perRow - 1)) * (Number.isFinite(Gh) ? Gh : 0);
+        const startX = sidePad + Math.max(0, (usableW - totalRowW) / 2);
+
+        // Apply to each visible port in DOM order (matches the rendered order).
+        let i = 0;
+        gs.forEach((g) => {
+          const id = String(g.getAttribute("data-entity") || "").trim();
+          if (!id) return;
+          const col = i % perRow;
+          const row = Math.floor(i / perRow);
+          const x = startX + col * (P + (Number.isFinite(Gh) ? Gh : 0));
+          const y = topPad + row * (P + (Number.isFinite(Gv) ? Gv : 0)) + 18;
+          setPortXY(id, applySnap(x), applySnap(y));
+          i++;
+        });
+
+        // Also clear selection when doing a full reset.
+        this._calibSel?.clear?.();
+        refreshSelectionStyles();
+        refreshSelCount();
+
+        this._calibDirty = true;
+      } catch (e) {
+        // Fall back to a simple clear if something unexpected happens.
+        this._calibMap = {};
+      }
+
       refreshExport();
     });
 
@@ -3177,7 +3296,8 @@ if (boxSelecting && boxStart) {
 
 
       const P = this._config.port_size;
-      const G = this._config.gap;
+      const Gh = Number(this._config.horizontal_port_gap);
+      const Gv = Number(this._config.vertical_port_gap);
       const perRow = Math.max(1, this._config.ports_per_row);
       const rows = Math.max(1, Math.ceil((panelPorts.length || perRow) / perRow));
       const W = this._config.panel_width;
@@ -3187,12 +3307,14 @@ if (boxSelecting && boxStart) {
       // is handled later by expanding maxBottom only when a label would extend past
       // the current SVG bounds.
       const rowPad = 18;
-      let H = 20 + topPad + rows * (P + G) + rowPad;
+      let H = 20 + topPad + rows * (P + Gv) + rowPad;
       let maxBottom = H;
       const plate = useBg ? "" : `<rect x="10" y="10" width="${W - 20}" height="${H - 20}" rx="8"
         fill="var(--ha-card-background, var(--card-background-color, #1f2937))" stroke="var(--divider-color, #4b5563)"/>`;
 
-const usableW = W - 2 * sidePad, slotW = usableW / perRow;
+const usableW = W - 2 * sidePad;
+      const totalRowW = perRow * P + Math.max(0, (perRow - 1)) * Gh;
+      const startX = sidePad + Math.max(0, (usableW - totalRowW) / 2);
 
       // Optional per-port positioning overrides (panel view)
       // Map keys are interface Names (e.g. "Gi1/0/1"). Matching is case-insensitive.
@@ -3232,8 +3354,8 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
           if (_ssmIsHiddenPort(this._config, _name, _id)) continue;
 
           const _idx = _i % perRow, _row = Math.floor(_i / perRow);
-          let _x = sidePad + _idx * slotW + (slotW - P) / 2;
-          let _y = topPad + _row * (P + G) + 18;
+          let _x = startX + _idx * (P + Gh);
+          let _y = topPad + _row * (P + Gv) + 18;
 
           if (portPos) {
             const _key = String(_name).trim().toLowerCase();
@@ -3264,8 +3386,8 @@ const usableW = W - 2 * sidePad, slotW = usableW / perRow;
         if (_ssmIsHiddenPort(this._config, name, id)) return "";
         const alias = a.Alias;
         const idx = i % perRow, row = Math.floor(i / perRow);
-        let x = sidePad + idx * slotW + (slotW - P) / 2;
-        let y = topPad + row * (P + G) + 18;
+        let x = startX + idx * (P + Gh);
+        let y = topPad + row * (P + Gv) + 18;
 
         // Apply explicit position override if provided (values are SVG coords for the port's top-left).
         if (portPos) {
@@ -3298,7 +3420,14 @@ if (Number.isFinite(y) && Number.isFinite(Ps)) {
           const nm = (() => {
             if (!numbersOnly) return rawNm;
             const s = rawNm;
-            // Numbers-only labels: always use the right-most trailing digits (e.g. "2.5G 12" -> "12", "Gi1/0/47" -> "47")
+            // Numbers-only labels: choose source
+            const from = (this._config.label_numbers_from || "index");
+            if (from === "index") {
+              const ifidx = (a.Index ?? a.IfIndex ?? a.ifIndex ?? a.ifindex ?? null);
+              const v = Number.isFinite(Number(ifidx)) ? Number(ifidx) : (i + 1);
+              return String(v);
+            }
+            // Port name: use the right-most trailing digits (e.g. "2.5G 12" -> "12", "Gi1/0/47" -> "47")
             const m = s.match(/(\d+)\s*$/);
             return m ? m[1] : s;
           })();
@@ -3314,20 +3443,35 @@ if (Number.isFinite(y) && Number.isFinite(Ps)) {
             // Split (2 row): top row labels above, bottom row labels below.
             // Use actual Y midpoint so we split by rendered rows even with non-standard perRow.
             pos = (_splitMidY != null && y <= _splitMidY) ? "above" : "below";
-          }
-          // Labels are overlay-only. We keep them inside the existing SVG bounds so they do not
+          }          // Labels are overlay-only. We keep them inside the existing SVG bounds so they do not
           // change panel height (unless the user explicitly makes the panel smaller than labels).
+
+          // Keep labels perfectly centered when position is "inside" by anchoring to the port center.
+          const isInside = (pos === "inside");
           const desiredY = (pos === "above")
             ? (y - rectH - 2)
-            : (pos === "inside")
+            : isInside
               ? (y + (Ps - rectH) / 2)
               : (y + Ps + 2);
-          const rectY = Math.min(Math.max(desiredY, 2), Math.max(2, H - rectH - 2));
 
-          const textY = rectY + fs + padY - 0.5;
+          // Clamp above/below labels to the viewBox bounds; for inside, allow natural centering.
+          const rectY = isInside
+            ? desiredY
+            : Math.min(Math.max(desiredY, 2), Math.max(2, H - rectH - 2));
+
           const bg = String(labelBg || "").trim();
-          const bgRect = bg ? `<rect class="portlabel-bg" data-entity="${id}" x="${rectX}" y="${rectY}" width="${estW}" height="${rectH}" rx="2" ry="2" fill="${bg}" style="pointer-events:none"></rect>` : "";
-          labels.push(`${bgRect}<text class="portlabel" data-entity="${id}" x="${x + Ps / 2}" y="${textY}" text-anchor="middle" dominant-baseline="alphabetic" style="${(this._config.label_numbers_only && this._config.label_outline) ? 'paint-order:stroke fill;stroke:#000;stroke-width:2px;stroke-linejoin:round;' : ''} pointer-events:none; fill:${labelColor};" fill="${labelColor}">${nm}</text>`);
+          const bgRect = bg
+            ? `<rect class="portlabel-bg" data-entity="${id}" x="${rectX}" y="${rectY}" width="${estW}" height="${rectH}" rx="2" ry="2" fill="${bg}" style="pointer-events:none"></rect>`
+            : "";
+
+          const textX = (x + Ps / 2);
+          // "dominant-baseline: middle" can render a hair high depending on font metrics.
+          // Nudge down slightly for consistent visual centering in the port.
+          const insideNudge = Math.max(0.5, fs * 0.12);
+          const textY = isInside ? (y + Ps / 2 + insideNudge) : (rectY + fs + padY - 0.5);
+          const dominant = isInside ? "middle" : "alphabetic";
+
+          labels.push(`${bgRect}<text class="portlabel" data-entity="${id}" x="${textX}" y="${textY}" text-anchor="middle" dominant-baseline="${dominant}" style="${(this._config.label_numbers_only && this._config.label_outline) ? 'paint-order:stroke fill;stroke:#000;stroke-width:2px;stroke-linejoin:round;' : ''} pointer-events:none; fill:${labelColor};" fill="${labelColor}">${nm}</text>`);
         }
         const titleParts = [];
         if (alias) titleParts.push(`${alias}`);
@@ -4546,26 +4690,33 @@ details.section > summary::after{
                     <div class="rowhead"><label for="ports_per_row">Ports per row</label><div class="helpiconbtn" data-help-title="Ports per row" data-help="ports_per_row"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
                     <input id="ports_per_row" type="number" min="1" value="${(this._editingFields?.has('ports_per_row') && this._draftValues?.ports_per_row != null) ? this._draftValues.ports_per_row : (c.ports_per_row != null ? Number(c.ports_per_row) : 24)}"${c.view === "list" ? " disabled" : ""}>
                   </div>
-                  ` : ""}${c.view === "panel" ? `
-<div class="row">
+                  <div class="row">
                     <div class="rowhead"><label for="panel_width">Panel width</label><div class="helpiconbtn" data-help-title="Panel width" data-help="panel_width"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
                     <input id="panel_width" type="number" min="200" value="${(this._editingFields?.has('panel_width') && this._draftValues?.panel_width != null) ? this._draftValues.panel_width : (c.panel_width != null ? Number(c.panel_width) : 740)}"${c.view === "list" ? " disabled" : ""}>
                   </div>
-                ` : ""}
-</div>
+                ` : ""}</div>
+
+                <div class="row">${c.view === "panel" ? `
+                  <div class="rowhead"><label for="port_scale">Port scale</label><div class="helpiconbtn" data-help-title="Port scale" data-help="port_scale"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
+                  <input id="port_scale" type="number" step="0.05" min="0.1" value="${c.port_scale != null ? Number(c.port_scale) : 1}"${c.view === "list" ? " disabled" : ""}>
+                ` : ""}</div>
 
                 <div class="row two">${c.view === "panel" ? `
                   <div class="row">
-                    <div class="rowhead"><label for="port_scale">Port scale</label><div class="helpiconbtn" data-help-title="Port scale" data-help="port_scale"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
-                    <input id="port_scale" type="number" step="0.05" min="0.1" value="${c.port_scale != null ? Number(c.port_scale) : 1}"${c.view === "list" ? " disabled" : ""}>
+                    <div class="rowhead">
+                      <label for="horizontal_port_gap">Horizontal port gap</label>
+                      <div class="helpiconbtn" data-help-title="Horizontal port gap" data-help="horizontal_port_gap"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div>
+                    </div>
+                    <input id="horizontal_port_gap" type="number" min="0" value="${(this._draftValues?.horizontal_port_gap != null) ? this._draftValues.horizontal_port_gap : (c.horizontal_port_gap != null ? Number(c.horizontal_port_gap) : 10)}"${c.view === "list" ? " disabled" : ""}>
                   </div>
-                  ` : ""}${c.view === "panel" ? `
-<div class="row">
-                    <div class="rowhead"><label for="gap">Port gap</label><div class="helpiconbtn" data-help-title="Port gap" data-help="port_gap"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
-                    <input id="gap" type="number" min="0" value="${(this._editingFields?.has('gap') && this._draftValues?.gap != null) ? this._draftValues.gap : (c.gap != null ? Number(c.gap) : 10)}"${c.view === "list" ? " disabled" : ""}>
+                  <div class="row">
+                    <div class="rowhead">
+                      <label for="vertical_port_gap">Vertical port gap</label>
+                      <div class="helpiconbtn" data-help-title="Vertical port gap" data-help="vertical_port_gap"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div>
+                    </div>
+                    <input id="vertical_port_gap" type="number" min="0" value="${(this._draftValues?.vertical_port_gap != null) ? this._draftValues.vertical_port_gap : (c.vertical_port_gap != null ? Number(c.vertical_port_gap) : 10)}"${c.view === "list" ? " disabled" : ""}>
                   </div>
-                ` : ""}
-</div>
+                ` : ""}</div>
 
               </div>
             </details>
@@ -4612,13 +4763,26 @@ details.section > summary::after{
                   <ha-switch id="label_numbers_only" ${c.label_numbers_only ? " checked" : ""}${c.show_labels === false || c.view === "list" ? " disabled" : ""}></ha-switch>
                 </div>
 
-                
-<div class="row inline">
-  <label for="label_outline">Outline port numbers</label>
-	  <ha-switch id="label_outline"${c.label_outline ? " checked" : ""}${c.show_labels === false || c.view === "list" || c.label_numbers_only !== true ? " disabled" : ""}></ha-switch>
-  <div class="helpiconbtn" data-help-title="Outline port numbers" data-help="label_outline">
-    <ha-icon icon="mdi:help-circle-outline"></ha-icon>
+
+
+<div class="row inline" style="gap:10px; align-items:center;">
+  <div class="rowhead" style="display:flex; align-items:center; justify-content:flex-start; gap:6px; flex:1 1 auto;">
+    <label for="label_numbers_from" style="margin:0;">Numbers from</label>
+    <div class="helpiconbtn" data-help-title="Numbers from" data-help="label_numbers_from"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div>
   </div>
+  <select id="label_numbers_from" style="width:160px; margin-right:6px;"${c.show_labels === false || c.view === "list" || c.label_numbers_only !== true ? " disabled" : ""}>
+    <option value="index"${(c.label_numbers_from !== "port_name") ? " selected" : ""}>Index</option>
+    <option value="port_name"${(c.label_numbers_from === "port_name") ? " selected" : ""}>Port name</option>
+  </select>
+  <!-- spacer to keep this dropdown aligned with the row above (which has help+switch on the right) -->
+  <div style="width:82px;"></div>
+</div>
+<div class="row inline" style="gap:10px; align-items:center;">
+  <div class="rowhead" style="display:flex; align-items:center; gap:6px; flex:1 1 auto;">
+    <label for="label_outline" style="margin:0;">Outline port numbers</label>
+    <div class="helpiconbtn" data-help-title="Outline port numbers" data-help="label_outline"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div>
+  </div>
+  <ha-switch id="label_outline"${c.label_outline ? " checked" : ""}${c.show_labels === false || c.view === "list" || c.label_numbers_only !== true ? " disabled" : ""}></ha-switch>
 </div>
 ` : ""}${c.view === "panel" ? `
 <div class="row">
@@ -4814,10 +4978,6 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
         root.getElementById("panel_width")?.addEventListener("change", (ev) => {
           const v = parseInt(ev.target.value, 10);
           this._updateConfig("panel_width", (Number.isFinite(v) && v > 0) ? v : 740);
-        });
-        root.getElementById("gap")?.addEventListener("change", (ev) => {
-          const v = parseFloat(ev.target.value);
-          this._updateConfig("gap", (Number.isFinite(v) && v >= 0) ? v : 10);
         });
         // Drafted number inputs (avoid HA editor re-renders clobbering typing)
         const bindDraftNumber = (id, key, fallback, parseFn) => {
@@ -5037,6 +5197,24 @@ const updateSpeedColor = (label, color) => {
           const v = parseFloat(ev.target.value);
           this._updateConfig("port_scale", (Number.isFinite(v) && v > 0) ? v : 1);
         });
+
+// Horizontal/Vertical port gap (canonical keys)
+root.getElementById("horizontal_port_gap")?.addEventListener("change", (ev) => {
+  const v = Number(ev.target.value);
+  const next = { ...(this._config || {}) };
+  next.horizontal_port_gap = Number.isFinite(v) ? v : 10;
+  delete next.gap; delete next.gap_x; delete next.gap_y; delete next.port_gap_x; delete next.port_gap_y;
+  this._config = next;
+  this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: next } }));
+});
+root.getElementById("vertical_port_gap")?.addEventListener("change", (ev) => {
+  const v = Number(ev.target.value);
+  const next = { ...(this._config || {}) };
+  next.vertical_port_gap = Number.isFinite(v) ? v : 10;
+  delete next.gap; delete next.gap_x; delete next.gap_y; delete next.port_gap_x; delete next.port_gap_y;
+  this._config = next;
+  this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: next } }));
+});
         root.getElementById("port_positions")?.addEventListener("change", (ev) => {
           const raw = String(ev.target.value || "").trim();
           if (!raw) { this._updateConfig("port_positions", null); return; }
@@ -5090,6 +5268,10 @@ const updateSpeedColor = (label, color) => {
 
         root.getElementById("label_numbers_only")?.addEventListener("change", (ev) => {
           this._updateConfig("label_numbers_only", !!ev.target.checked);
+
+        root.getElementById("label_numbers_from")?.addEventListener("change", (ev) => {
+          this._updateConfig("label_numbers_from", String(ev.target.value || "index"));
+        });
         });
 // Outline port numbers (only used when "Port labels by number" is enabled)
 root.getElementById("label_outline")?.addEventListener("change", (ev) => {
@@ -5455,9 +5637,24 @@ root.getElementById("label_outline")?.addEventListener("change", (ev) => {
     text: "Only applies when Port colors is set to Speed. When enabled, clicking a port opens the bandwidth traffic graph (if bandwidth sensors exist for that port). If no bandwidth sensors are found, the normal port information popup is shown instead."
   },
 
+label_numbers_from: {
+  title: "Numbers from",
+  text: "When “Labels: numbers only” is enabled, choose where the number comes from: Index uses the interface index (IfIndex) when available (otherwise it falls back to the displayed order), while Port name extracts the right-most numbers from the port name."
+},
+
 label_outline: {
   title: "Outline port numbers",
   text: "Adds a black outline around numeric port labels to improve readability on bright backgrounds. This only applies when \"Port labels by number\" is enabled."
+},
+
+vertical_port_gap: {
+  title: "Vertical port gap",
+  text: "Spacing between ports in the panel layout. Horizontal controls left/right spacing; Vertical controls top/bottom spacing. Custom port positions from the Layout Editor override automatic spacing."
+},
+
+horizontal_port_gap: {
+  title: "Horizontal port gap",
+  text: "Spacing between ports in the panel layout. Horizontal controls left/right spacing; Vertical controls top/bottom spacing. Custom port positions from the Layout Editor override automatic spacing."
 },
 };
 
