@@ -1224,9 +1224,9 @@ renderGraph(force);
 
     const rxEntityId = `sensor.${baseObj}_rx_throughput`;
     const txEntityId = `sensor.${baseObj}_tx_throughput`;
-    // NOTE: Intentionally NOT checking for bandwidth sensor existence here.
-    // Some vendors/users have bandwidth sensor entity_ids that don't match this card's
-    // derived naming convention, which caused clicks to fall back to the port info popup.
+
+    // Only open if both sensors exist.
+    if (!hass.states?.[rxEntityId] || !hass.states?.[txEntityId]) return false;
 
     const st = hass.states[entity_id];
     const attrs = st?.attributes || {};
