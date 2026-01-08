@@ -230,7 +230,9 @@ This beta release introduces a significantly refined card editor experience, a m
   - Fixed editor switches not reflecting saved configuration state (e.g., Outline port numbers)
 - 🐞 **Speed aggregation with no device selected**
   - When no switch device is selected, port speeds are correctly detected and displayed instead of showing `Unknown`
- 
+
+---
+
 ## [0.3.5] - 2026-01-07
 ### Added
 - 🖥️ **Automatic card scaling for large displays**
@@ -279,3 +281,30 @@ This beta release introduces a significantly refined card editor experience, a m
   - Resetting positions now regenerates layout JSON instantly
   - JSON editor remains open after reset
 
+---
+
+## [v0.4.0] - 2026-01-08
+### Added
+- 🖼️ **Lovelace Card: Smart Diagnostics Defaults**
+  - Automatically adds high-signal switch-level diagnostics **only when data exists**
+  - Environment defaults:
+    - System Temperature
+    - System Temperature Status
+  - PoE defaults:
+    - PoE Power Used (W)
+    - PoE Power Available (W)
+  - Defaults are:
+    - Fully removable
+    - Reorderable
+    - Disable-able
+    - Never re-added once removed
+
+- 🧩 **Diagnostics Attribute Selection (Advanced)**
+  - Diagnostics can reference **specific sensor attributes** using:
+    ```
+    sensor.entity_id#attribute_name
+    ```
+  - Enables displaying Environment and PoE attributes when operating in **Attributes mode**
+  - Works transparently in both **Attributes** and **Sensors** modes
+
+---
