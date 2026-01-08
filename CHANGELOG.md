@@ -230,3 +230,52 @@ This beta release introduces a significantly refined card editor experience, a m
   - Fixed editor switches not reflecting saved configuration state (e.g., Outline port numbers)
 - 🐞 **Speed aggregation with no device selected**
   - When no switch device is selected, port speeds are correctly detected and displayed instead of showing `Unknown`
+ 
+## [0.3.5] - 2026-01-07
+### Added
+- 🖥️ **Automatic card scaling for large displays**
+  - Card now automatically scales to available space (e.g., 4K displays)
+  - Prevents tiny, unreadable cards on high-resolution dashboards
+- 🏷️ **Advanced label positioning**
+  - Labels can be positioned **Above**, **Below**, **Inside**, or **Split (2 row)**
+  - Split mode renders top-row labels above ports and bottom-row labels below ports
+- 🔢 **Numeric port label enhancements**
+  - Port labels can extract and display the right-most numeric portion of interface names (e.g., `2.5G 1`, `10G 2`)
+  - Optional **black outline** for numeric labels improves contrast on bright backgrounds
+- 🔒 **Optional read-only safety mode**
+  - New option to hide all **Turn on / Turn off** buttons from the card UI
+  - Useful for dashboards where accidental port toggles should be prevented
+- 🔢 **Numeric label source selector**
+  - New **“Numbers from”** option allows numeric port labels to be derived from:
+    - Interface **Index**
+    - Right-most numeric portion of the **Port name**
+  - Applies only when **Labels: numbers only** is enabled
+
+### Improved
+- 🎨 **Label readability**
+  - Numeric label outlines use SVG stroke rendering for crisp text in both Light and Dark themes
+- 🧭 **Layout Editor behavior**
+  - Label movement remains correctly aligned with ports during layout calibration
+  - Snap and gap behavior remains consistent regardless of label configuration
+- 🧩 **Editor layout consistency**
+  - Numeric label controls now align consistently with other label options
+  - Removed unintended spacing and redundant editor elements
+- 📊 **Bandwidth graph popup**
+  - Auto-refresh dropdown now uses a consistent select control
+  - Dropdown width adjusted to ensure full option text is visible
+  - Auto-refresh behavior now applies immediately without reopening the popup
+
+### Fixed
+- 🐞 **Label rendering stability**
+  - Port labels now behave as true overlays and no longer change panel height
+  - Background images no longer appear to “shift” when labels are enabled
+- 🐞 **Editor toggle state consistency**
+  - Fixed editor switches not reflecting saved configuration state (e.g., Outline port numbers)
+- 🐞 **Speed aggregation with no device selected**
+  - When no switch device is selected, port speeds are correctly detected and displayed instead of showing `Unknown`
+- 🐞 **Layout Editor order updates**
+  - Changing **Odd/Even vs Numeric** order now reflows ports immediately
+- 🐞 **Layout Editor JSON reset**
+  - Resetting positions now regenerates layout JSON instantly
+  - JSON editor remains open after reset
+
