@@ -148,7 +148,46 @@ class SnmpSwitchManagerCard extends HTMLElement {
     // Editor draft values to prevent re-render from clobbering input while typing
     this._draftValues = {};
     this._editingFields = new Set();
+    // Background image aspect cache (for Panel width = 0 autosizing without stretching)
+    this._bgAspectByUrl = new Map();   // url -> aspect (w/h)
+    this._bgAspectLoading = new Set(); // urls in flight
 }
+
+
+  connectedCallback() {
+    // Lazily probe background image aspect ratio in the browser.
+    try { this._maybeLoadBgAspect(); } catch (e) {}
+  }
+
+  _maybeLoadBgAspect() {
+    const url = String(this._config?.background_image || "").trim();
+    if (!url) return;
+    if (this._bgAspectByUrl.has(url)) return;
+    if (this._bgAspectLoading.has(url)) return;
+    if (typeof Image === "undefined") return;
+
+    this._bgAspectLoading.add(url);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const w = Number(img.naturalWidth || img.width);
+        const h = Number(img.naturalHeight || img.height);
+        if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+          this._bgAspectByUrl.set(url, w / h);
+          // Re-render now that we know the aspect.
+          this.requestUpdate?.();
+          this._render?.();
+        }
+      } finally {
+        this._bgAspectLoading.delete(url);
+      }
+    };
+    img.onerror = () => { this._bgAspectLoading.delete(url); };
+    // Use absolute URL resolution to match what the browser will load in CSS.
+    try { img.src = new URL(url, window.location.href).toString(); }
+    catch (e) { img.src = url; }
+  }
+
 
 
 _layoutEditorSessionKey() {
@@ -182,6 +221,7 @@ _setLayoutEditorSessionClosed() {
       // Port color representation: "state" (default) or "speed"
       color_mode: (config.color_mode === "speed") ? "speed" : "state",
       // Optional per-speed color overrides (keyed by normalized speed labels like "1 Gbps")
+      show_all_speeds: config.show_all_speeds === true,
       speed_colors: (config.speed_colors && typeof config.speed_colors === "object" && !Array.isArray(config.speed_colors))
         ? { ...config.speed_colors }
         : null,
@@ -275,7 +315,7 @@ _setLayoutEditorSessionClosed() {
       label_numbers_only: config.label_numbers_only === true,
       label_outline: config.label_outline === true,
 
-      // Uplinks (Smart Assist)
+      // Uplinks
       show_uplinks_separately: config.show_uplinks_separately === true,
       uplink_ports: Array.isArray(config.uplink_ports) ? config.uplink_ports : (typeof config.uplink_ports === "string" ? config.uplink_ports.split(",").map(s=>s.trim()).filter(Boolean) : []),
       // When Port colors = Speed: clicking a port can open the traffic graph instead of the port info modal
@@ -635,39 +675,29 @@ _setLayoutEditorSessionClosed() {
           continue;
         }
       }
-      const rxStr = (this._config?.physical_regex || "").trim();
-      const prefStr = (this._config?.physical_prefixes || "").trim();
+      const a = st.attributes || {};
+
+      // Classification: use Port Type attribute from the integration (preferred).
+      // - If Port Type is "unknown"/empty → default to VIRTUAL (cannot be classified).
+      // - If the user configured Virtual interface overrides: everything NOT in the overrides list is treated as PHYSICAL.
+      const portTypeRaw =
+        (a["Port Type"] ?? a.PortType ?? a.port_type ?? a.portType ?? a.port_type_label ?? a.portTypeLabel ?? a.Type ?? a.type ?? "");
+      const portType = String(portTypeRaw).trim().toLowerCase();
 
       let isPhysical = false;
 
-      // 1) Advanced override: regex (case-insensitive)
-      if (rxStr) {
-        try {
-          const rx = new RegExp(rxStr, "i");
-          isPhysical = rx.test(n) || rx.test(id);
-        } catch (e) {
-          // Invalid regex: fall back to prefixes/defaults
-          isPhysical = false;
-        }
-      }
-
-      // 2) Easy mode: comma-separated prefixes (used only if regex not set/invalid)
-      if (!isPhysical && !rxStr) {
-        const prefs = prefStr
-          ? prefStr.split(",").map(s => s.trim()).filter(Boolean)
-          : [];
-        if (prefs.length) {
-          const nUp = n.toUpperCase();
-          isPhysical = prefs.some(p => nUp.startsWith(String(p).trim().toUpperCase()));
-        }
-      }
-
-      // 3) Default behavior (backwards compatible)
-      if (!isPhysical && !rxStr && !prefStr) {
-        isPhysical =
-          /^(GI|TE|TW)/.test(n) ||
-          n.startsWith("SLOT") ||
-          /^switch\.(gi|te|tw)\d+_\d+_\d+$/i.test(id);
+      if (_virtSet && _virtSet.size) {
+        // If we reach here, it wasn't matched as virtual above, so treat as physical.
+        isPhysical = true;
+      } else if (!portType || portType === "unknown" || portType === "-" || portType === "unavailable") {
+        isPhysical = false;
+      } else {
+        // Be tolerant of common vendor spellings.
+        if (portType === "physical" || portType === "phys") isPhysical = true;
+        else if (portType === "virtual" || portType === "virt") isPhysical = false;
+        else if (portType.includes("phys")) isPhysical = true;
+        else if (portType.includes("virtual")) isPhysical = false;
+        else isPhysical = false; // safest default
       }
       if (isPhysical) phys.push([id, st]);
       else virt.push([id, st]);
@@ -708,6 +738,7 @@ _setLayoutEditorSessionClosed() {
       "50 Gbps": "#d946ef",      // fuchsia
       "100 Gbps": "#ec4899",     // pink
       "Disconnected": "#ef4444", // red (was Unknown)
+      "Admin Down": "#6b7280",   // gray (admin disabled)
       "Unknown": "#ef4444",      // legacy key
     };
   }
@@ -788,8 +819,14 @@ _setLayoutEditorSessionClosed() {
       const palette = this._defaultSpeedPalette();
       const attrs = st?.attributes || null;
 
+      // Admin Down should win over speed/disconnected.
+      const adminRaw = (attrs?.Admin ?? attrs?.admin_status ?? attrs?.admin ?? attrs?.ifAdminStatus ?? "").toString().toLowerCase();
+      const operRaw = (attrs?.Oper ?? attrs?.oper_status ?? attrs?.oper ?? attrs?.ifOperStatus ?? "").toString().toLowerCase();
+      const isAdminDown = adminRaw.includes("down") || adminRaw.includes("disabled") || adminRaw.includes("false") || adminRaw.includes("0");
+      const isOperDown = operRaw.includes("down") || operRaw.includes("lowerlayerdown") || operRaw.includes("notpresent") || operRaw.includes("dormant") || operRaw.includes("unknown") || operRaw.includes("false") || operRaw.includes("0");
+
       // Prefer the integration's normalized human label when available.
-      const label = this._speedLabelFromAttrs(attrs) || "Disconnected";
+      const label = isAdminDown ? "Admin Down" : (isOperDown ? "Disconnected" : (this._speedLabelFromAttrs(attrs) || "Disconnected"));
 
       // Per-speed override (stored in config) wins over defaults.
       const overrides = this._config?.speed_colors || null;
@@ -1361,6 +1398,63 @@ renderGraph(force);
     _add("speed", "Speed:", attrs.Speed);
     _add("duplex", "Duplex:", attrs.Duplex);
     _add("poe", "PoE:", attrs.PoE ?? attrs.Poe ?? attrs.POE);
+
+    // Per-interface PoE in Sensors mode: show PoE sensor value (like bandwidth sensors)
+    // when the switch port entity does not expose a PoE attribute but a PoE sensor exists.
+    if (_isBlank(attrs.PoE ?? attrs.Poe ?? attrs.POE) && baseObj) {
+      const H = this._hass?.states || {};
+      const prefix = `sensor.${baseObj}_`;
+
+      // Prefer common, explicit PoE sensor suffixes if present.
+      const preferred = [
+        `sensor.${baseObj}_poe_power`,
+        `sensor.${baseObj}_poe`,
+        `sensor.${baseObj}_poe_watts`,
+        `sensor.${baseObj}_poe_draw`,
+        `sensor.${baseObj}_poe_consumption`,
+        `sensor.${baseObj}_poe_usage`,
+        `sensor.${baseObj}_poe_used`,
+        `sensor.${baseObj}_poe_output`,
+        `sensor.${baseObj}_poe_load`,
+      ];
+
+      const _validSensor = (eid) => {
+        const stx = H[eid];
+        if (!stx) return null;
+        const s = (stx.state ?? "").toString();
+        const sl = s.toLowerCase();
+        if (sl === "unknown" || sl === "unavailable" || sl === "") return null;
+        const u = stx.attributes?.unit_of_measurement;
+        return `${s}${u ? ` ${u}` : ""}`;
+      };
+
+      let poeVal = null;
+      for (const eid of preferred) {
+        poeVal = _validSensor(eid);
+        if (poeVal) break;
+      }
+
+      // Fallback: find any sensor for this port that contains "poe".
+      if (!poeVal) {
+        const candidates = Object.keys(H)
+          .filter((k) => k.startsWith(prefix) && k.includes("poe"))
+          .sort((a, b) => {
+            // Put "power"-like sensors first.
+            const ap = a.includes("power") ? 0 : 1;
+            const bp = b.includes("power") ? 0 : 1;
+            if (ap !== bp) return ap - bp;
+            return a.localeCompare(b);
+          });
+        for (const eid of candidates) {
+          poeVal = _validSensor(eid);
+          if (poeVal) break;
+        }
+      }
+
+      if (poeVal) {
+        _add("poe_sensor", "PoE:", poeVal);
+      }
+    }
 
     // Bandwidth sensors (non-attribute info) — derived from switch port entity_id base.
     // This stays stable even if the user changes port display names via rename rules.
@@ -1983,6 +2077,16 @@ _isCalibrationEnabled() {
       })).filter(p => p.id && (!separateUplinks || !uplinkSet.size || !uplinkSet.has(String(p.name||"").trim().toLowerCase())));
       if (!main.length) return;
 
+      // If the user has explicitly positioned any main (non-uplink) ports, do not auto-pack them.
+      const _posRaw = (this._isCalibrationEnabled() && this._calibMap && typeof this._calibMap === "object")
+        ? this._calibMap
+        : (this._config?.port_positions && typeof this._config.port_positions === "object" ? this._config.port_positions : null);
+      if (_posRaw && typeof _posRaw === "object") {
+        const _posKeys = new Set(Object.keys(_posRaw).map(k => String(k||"").trim().toLowerCase()).filter(Boolean));
+        const _hasMainPos = main.some(p => _posKeys.has(String(p.name||"").trim().toLowerCase()));
+        if (_hasMainPos) return;
+      }
+
       // Order: numeric (default) or odd/even (2-row)
       const orderMode = (typeof this._calibPortsOrder === "string" && this._calibPortsOrder) ? this._calibPortsOrder : "numeric";
 
@@ -2107,6 +2211,8 @@ _isCalibrationEnabled() {
         sw: [b.x - hs, b.y + b.h - hs],
         w:  [b.x - hs, b.y + b.h/2 - hs],
       };
+
+
       uplHandles.forEach(el => {
         const k = el.getAttribute("data-h");
         const p = pts[k];
@@ -2115,6 +2221,98 @@ _isCalibrationEnabled() {
         el.setAttribute("y", String(p[1]));
       });
     };
+
+// Keep the Uplinks box enclosing all uplink ports (without restricting dragging).
+const fitUplinkBoxToPorts = () => {
+  try {
+    const separateUplinks = !!this._config?.show_uplinks_separately;
+    const uplinkSet = new Set(((this._config?.uplink_ports || [])).map(s => String(s).trim().toLowerCase()).filter(Boolean));
+    if (!separateUplinks || !uplinkSet.size) return;
+    if (!this._calibUplinkBoxMode) return;
+
+    const gs = Array.from(svg.querySelectorAll(".port-svg[data-entity]"));
+    const upl = gs
+      .map(g => ({ g, id: g.getAttribute("data-entity"), name: (g.getAttribute("data-portname") || "") }))
+      .filter(p => p.id && uplinkSet.has(String(p.name || "").trim().toLowerCase()));
+    if (!upl.length) return;
+
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let pw = null, ph = null;
+
+    upl.forEach(p => {
+      const r = p.g.querySelector("rect");
+      if (!r) return;
+      const x = parseFloat(r.getAttribute("x"));
+      const y = parseFloat(r.getAttribute("y"));
+      const w = parseFloat(r.getAttribute("width"));
+      const h = parseFloat(r.getAttribute("height"));
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h)) return;
+      pw = (pw == null) ? w : pw;
+      ph = (ph == null) ? h : ph;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x + w);
+      maxY = Math.max(maxY, y + h);
+    });
+
+    if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return;
+
+    const pad = 0;
+    const nx = Math.max(0, minX - pad);
+    const ny = Math.max(0, minY - pad);
+    const minW = (pw != null && Number.isFinite(pw)) ? pw : 1;
+    const minH = (ph != null && Number.isFinite(ph)) ? ph : 1;
+    const nw = Math.max(minW, (maxX - minX) + (pad * 2));
+    const nh = Math.max(minH, (maxY - minY) + (pad * 2));
+    this._calibUplinkBox = { x: nx, y: ny, w: nw, h: nh };
+    updateUplinkBoxSvg();
+    this._calibDirty = true;
+  } catch (e) {}
+};
+
+// Keep the Ports box enclosing all NON-uplink ports (without restricting dragging).
+const fitPortsBoxToPorts = () => {
+  try {
+    if (!this._calibPortsBoxMode) return;
+    const uplinkSet = new Set(((this._config?.uplink_ports || [])).map(s => String(s).trim().toLowerCase()).filter(Boolean));
+
+    const gs = Array.from(svg.querySelectorAll(".port-svg[data-entity]"));
+    const main = gs
+      .map(g => ({ g, id: g.getAttribute("data-entity"), name: (g.getAttribute("data-portname") || "") }))
+      .filter(p => p.id && !uplinkSet.has(String(p.name || "").trim().toLowerCase()));
+    if (!main.length) return;
+
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let pw = null, ph = null;
+
+    main.forEach(p => {
+      const r = p.g.querySelector("rect");
+      if (!r) return;
+      const x = parseFloat(r.getAttribute("x"));
+      const y = parseFloat(r.getAttribute("y"));
+      const w = parseFloat(r.getAttribute("width"));
+      const h = parseFloat(r.getAttribute("height"));
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h)) return;
+      pw = (pw == null) ? w : pw;
+      ph = (ph == null) ? h : ph;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x + w);
+      maxY = Math.max(maxY, y + h);
+    });
+
+    if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return;
+
+    const pad = 0;
+    const nx = Math.max(0, minX - pad);
+    const ny = Math.max(0, minY - pad);
+    const nw = Math.max(40, (maxX - minX) + (pad * 2));
+    const nh = Math.max(40, (maxY - minY) + (pad * 2));
+    this._calibPortsBox = { x: nx, y: ny, w: nw, h: nh };
+    updatePortsBoxSvg();
+    this._calibDirty = true;
+  } catch (e) {}
+};
 
     const applyUplinkBoxLayout = () => {
       const b = normBox(this._calibUplinkBox);
@@ -2128,20 +2326,46 @@ _isCalibrationEnabled() {
         .filter(p => p.id && uplinkSet.has(String(p.name||"").trim().toLowerCase()));
       if (!upl.length) return;
 
+      // If the user has explicitly positioned any uplink ports, do not auto-pack them.
+      const _posRaw = (this._isCalibrationEnabled() && this._calibMap && typeof this._calibMap === "object")
+        ? this._calibMap
+        : (this._config?.port_positions && typeof this._config.port_positions === "object" ? this._config.port_positions : null);
+      if (_posRaw && typeof _posRaw === "object") {
+        const _posKeys = new Set(Object.keys(_posRaw).map(k => String(k||"").trim().toLowerCase()).filter(Boolean));
+        const _hasUplinkPos = upl.some(p => _posKeys.has(String(p.name||"").trim().toLowerCase()));
+        if (_hasUplinkPos) return;
+      }
+
       const n = upl.length;
-      const w = Math.max(10, b.w);
-      const h = Math.max(10, b.h);
-      const ratio = w / h;
+      const w = Math.max(10, Number(b.w) || 0);
+      const h = Math.max(10, Number(b.h) || 0);
+
+      // Account for port size so ports stay INSIDE the box.
+      const firstRect = root.querySelector(".port-svg rect");
+      const portW = (firstRect && Number.isFinite(parseFloat(firstRect.getAttribute("width"))))
+        ? parseFloat(firstRect.getAttribute("width"))
+        : Number(this._config?.port_size || 18);
+      const portH = (firstRect && Number.isFinite(parseFloat(firstRect.getAttribute("height"))))
+        ? parseFloat(firstRect.getAttribute("height"))
+        : portW;
+
+      const spanX = Math.max(0, w - portW);
+      const spanY = Math.max(0, h - portH);
+      const ratio = (spanY > 0) ? (spanX / spanY) : (spanX || 1);
+
       const cols = Math.max(1, Math.round(Math.sqrt(n * ratio)));
       const rows = Math.max(1, Math.ceil(n / cols));
-      const stepX = (cols > 1) ? (w / (cols - 1)) : 0;
-      const stepY = (rows > 1) ? (h / (rows - 1)) : 0;
+      const stepX = (cols > 1) ? (spanX / (cols - 1)) : 0;
+      const stepY = (rows > 1) ? (spanY / (rows - 1)) : 0;
+
+      const baseX = Number(b.x) || 0;
+      const baseY = Number(b.y) || 0;
 
       upl.forEach((p, idx) => {
         const c = idx % cols;
         const r = Math.floor(idx / cols);
-        const x = Number(b.x) + stepX * c;
-        const y = Number(b.y) + stepY * r;
+        const x = baseX + stepX * c;
+        const y = baseY + stepY * r;
         setPortXY(p.id, applySnap(x), applySnap(y));
       });
     };
@@ -2165,14 +2389,15 @@ _isCalibrationEnabled() {
         const orderWrap = root.getElementById("ssm-calib-order-wrap");
         if (orderWrap) orderWrap.style.display = this._calibPortsBoxMode ? "" : "none";
 
-        // Create a default box if enabling and none exists
+        // Create a default box if enabling and none exists (then fit to current non-uplink ports)
         if (this._calibPortsBoxMode && !normBox(this._calibPortsBox)) {
-          const vb = svg.viewBox?.baseVal;
-          const W = vb ? vb.width : 800;
-          const H = vb ? vb.height : 260;
-          // default to the main switch face area
-          this._calibPortsBox = { x: 20, y: 20, w: Math.max(220, W - 260), h: Math.max(120, H - 60) };
+          this._calibPortsBox = { x: 20, y: 20, w: 240, h: 160 };
         }
+        if (this._calibPortsBoxMode) {
+          fitPortsBoxToPorts();
+        }
+
+        
 
         updatePortsBoxSvg();
         applyPortsBoxLayout();
@@ -2202,7 +2427,7 @@ _isCalibrationEnabled() {
     }
 
 
-    // Uplinks Box toggle (Smart Assist)
+    // Uplinks Box toggle
     if (uplBtn && !uplBtn._ssmBound) {
       uplBtn._ssmBound = true;
       uplBtn.addEventListener("click", () => {
@@ -2217,14 +2442,18 @@ _isCalibrationEnabled() {
         setMsg(this._calibUplinkBoxMode ? "Uplinks box: drag to draw, drag handles to resize" : "");
         setUplinkBoxVisible(!!this._calibUplinkBoxMode);
 
-        // Create a default box if enabling and none exists
+        // Create a default box if enabling and none exists (then fit to current uplink ports)
         if (this._calibUplinkBoxMode && !normBox(this._calibUplinkBox)) {
-          const vb = svg.viewBox?.baseVal;
-          const W = vb ? vb.width : 800;
-          const H = vb ? vb.height : 260;
-          this._calibUplinkBox = { x: Math.max(10, W - 220), y: Math.max(10, 40), w: 200, h: 140 };
+          this._calibUplinkBox = { x: 20, y: 20, w: 200, h: 140 };
           // Do NOT persist layout editor changes until the user explicitly clicks Save.
         }
+        if (this._calibUplinkBoxMode) {
+          // Match Ports box behavior: when enabling the tool, tighten the Uplinks box
+          // around existing uplink port positions with no padding.
+          try { fitUplinkBoxToPorts(); } catch (e) {}
+        }
+
+        
         updateUplinkBoxSvg();
         applyUplinkBoxLayout();
         this._calibDirty = true;
@@ -2368,7 +2597,7 @@ _isCalibrationEnabled() {
         const Gh = Number(this._config?.horizontal_port_gap);
         const Gv = Number(this._config?.vertical_port_gap);
         const perRow = Math.max(1, parseInt(this._config?.ports_per_row, 10) || 24);
-        const W = Number(this._config?.panel_width || 1440);
+        const W = Number((this._config?.panel_width ?? 1440));
         const sidePad = 28;
         const topPad = 24;
         const usableW = W - 2 * sidePad;
@@ -2565,7 +2794,7 @@ _isCalibrationEnabled() {
     root.getElementById("ssm-calib-align-col")?.addEventListener("click", alignCol);
     root.getElementById("ssm-calib-dist-h")?.addEventListener("click", () => distribute("x"));
     root.getElementById("ssm-calib-dist-v")?.addEventListener("click", () => distribute("y"));
-    // Cursor coordinates + smart assist clicks + marquee select
+    // Cursor coordinates + box clicks + marquee select
     const hit = root.getElementById("ssm-calib-hit");
     if (hit && !hit._ssmBound) {
       hit._ssmBound = true;
@@ -2574,7 +2803,7 @@ _isCalibrationEnabled() {
       let boxPid = null;
       let boxStart = null;
 
-	      // Smart Assist drag-box state
+	      // Auto layout drag-box state
 	      let saDragging = false;
 	      let saPid = null;
 	      let saStart = null;
@@ -2593,7 +2822,12 @@ _isCalibrationEnabled() {
       let pbKind = null; // "draw" | "move" | "resize"
       let pbHandle = null;
       let pbStart = null;
-      let pbOrig = null;
+      let pbOrig = null
+      let pbMoveStartPositions = null; // Map entity_id -> {x,y} for moving ports box
+      let pbResizeStartPositions = null; // Map entity_id -> {x,y} for resizing ports box
+      let ubMoveStartPositions = null; // Map entity_id -> {x,y} for moving uplinks box
+      let ubResizeStartPositions = null; // Map entity_id -> {x,y} for resizing uplinks box
+;
 	const onMove = (ev) => {
         const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
         if (elXY) elXY.textContent = `${Math.round(pt.x)}, ${Math.round(pt.y)}`;
@@ -2645,6 +2879,12 @@ _isCalibrationEnabled() {
           } else if (pbKind === "move") {
             nb.x = b0.x + dx;
             nb.y = b0.y + dy;
+            // Move physical ports along with the box (container behavior).
+            if (pbMoveStartPositions && pbMoveStartPositions.size) {
+              pbMoveStartPositions.forEach((pos, id) => {
+                setPortXY(id, applySnap(pos.x + dx), applySnap(pos.y + dy));
+              });
+            }
           } else if (pbKind === "resize") {
             const h = String(pbHandle || "");
             if (h.includes("e")) nb.w = Math.max(minW, b0.w + dx);
@@ -2661,9 +2901,31 @@ _isCalibrationEnabled() {
             }
           }
 
-          this._calibPortsBox = nb;
+          
+          // When resizing, treat the box as a container: scale main (non-uplink) ports to stay inside.
+          if (pbKind === "resize" && pbResizeStartPositions && pbResizeStartPositions.size) {
+            const ow = Math.max(1e-6, Number(b0.w) || 0);
+            const oh = Math.max(1e-6, Number(b0.h) || 0);
+            const nx = Number(nb.x) || 0;
+            const ny = Number(nb.y) || 0;
+            const nw = Math.max(1e-6, Number(nb.w) || 0);
+            const nh = Math.max(1e-6, Number(nb.h) || 0);
+
+            const clamp01 = (v) => (v < 0 ? 0 : (v > 1 ? 1 : v));
+
+            pbResizeStartPositions.forEach((pos, id) => {
+              if (!pos || !id) return;
+              const rx = clamp01((Number(pos.x) - Number(b0.x)) / ow);
+              const ry = clamp01((Number(pos.y) - Number(b0.y)) / oh);
+              const x = nx + rx * nw;
+              const y = ny + ry * nh;
+              setPortXY(id, applySnap(x), applySnap(y));
+            });
+          }
+
+this._calibPortsBox = nb;
           updatePortsBoxSvg();
-          applyPortsBoxLayout();
+          if (pbKind === "draw") applyPortsBoxLayout();
           this._calibDirty = true;
           return;
         }
@@ -2688,6 +2950,12 @@ _isCalibrationEnabled() {
           } else if (ubKind === "move") {
             nb.x = b0.x + dx;
             nb.y = b0.y + dy;
+            // Move uplink ports along with the box (container behavior).
+            if (ubMoveStartPositions && ubMoveStartPositions.size) {
+              ubMoveStartPositions.forEach((pos, id) => {
+                setPortXY(id, applySnap(pos.x + dx), applySnap(pos.y + dy));
+              });
+            }
           } else if (ubKind === "resize") {
             const h = String(ubHandle || "");
             // edge/corner logic
@@ -2705,10 +2973,31 @@ _isCalibrationEnabled() {
             }
           }
 
-          this._calibUplinkBox = nb;
+          
+          // When resizing, treat the box as a container: scale uplink ports to stay inside.
+          if (ubKind === "resize" && ubResizeStartPositions && ubResizeStartPositions.size) {
+            const ow = Math.max(1e-6, Number(b0.w) || 0);
+            const oh = Math.max(1e-6, Number(b0.h) || 0);
+            const nx = Number(nb.x) || 0;
+            const ny = Number(nb.y) || 0;
+            const nw = Math.max(1e-6, Number(nb.w) || 0);
+            const nh = Math.max(1e-6, Number(nb.h) || 0);
+
+            const clamp01 = (v) => (v < 0 ? 0 : (v > 1 ? 1 : v));
+
+            ubResizeStartPositions.forEach((pos, id) => {
+              if (!pos || !id) return;
+              const rx = clamp01((Number(pos.x) - Number(b0.x)) / ow);
+              const ry = clamp01((Number(pos.y) - Number(b0.y)) / oh);
+              const x = nx + rx * nw;
+              const y = ny + ry * nh;
+              setPortXY(id, applySnap(x), applySnap(y));
+            });
+          }
+
+this._calibUplinkBox = nb;
           updateUplinkBoxSvg();
-          applyUplinkBoxLayout();
-          this._calibDirty = true;
+                    this._calibDirty = true;
           return;
         }
 
@@ -2740,7 +3029,7 @@ _isCalibrationEnabled() {
 	        try { hit.releasePointerCapture(ev.pointerId); } catch (e) {}
 	        const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
 	        if (isSa && saDragging && saStart) {
-	          // Commit Smart Assist box
+	          // Commit box
 	          saDragging = false;
 	          saPid = null;
 	          const pt2 = pt;
@@ -2751,7 +3040,7 @@ _isCalibrationEnabled() {
 	          this._calibAssistPt1 = null;
 	          setMsg("Applying…");
 	
-	          const applySmartAssist = (pt1, pt2) => {
+	          const applyAutoLayout = (pt1, pt2) => {
 	            // Build odd/top even/bottom two-row layout from currently rendered ports
 	            const gs = Array.from(root.querySelectorAll(".port-svg[data-entity]"));
 	            const ports = gs.map(g => {
@@ -2778,7 +3067,7 @@ _isCalibrationEnabled() {
 	            const yTop = Math.min(pt1.y, pt2.y);
 	            const yBot = Math.max(pt1.y, pt2.y);
 
-	            // Smart Assist should create a visible, resizable Ports box from the drag bounds
+	            // Auto layout should create a visible, resizable Ports box from the drag bounds
 	            // (same UX concept as the Uplinks box). This is editor-only state and is NOT
 	            // persisted until the user explicitly clicks Save.
 	            try {
@@ -2828,7 +3117,7 @@ _isCalibrationEnabled() {
 	              };
 	
 	              const box = ensureBox();
-	              // Make the Uplinks box visible/resizable after Smart Assist (editor-only state;
+	              // Make the Uplinks box visible/resizable after auto layout (editor-only state;
 	              // persisted only when the user clicks Save).
 	              try {
 	                this._calibUplinkBoxMode = true;
@@ -2837,23 +3126,40 @@ _isCalibrationEnabled() {
 	                updateUplinkBoxSvg();
 	              } catch (e) {}
 	              const placeInBox = (arr, b) => {
-	                const n = arr.length;
-	                if (!n) return;
-	                const w = Math.max(10, Number(b.w) || 0);
-	                const h = Math.max(10, Number(b.h) || 0);
-	                const ratio = w / h;
-	                const cols = Math.max(1, Math.round(Math.sqrt(n * ratio)));
-	                const rows = Math.max(1, Math.ceil(n / cols));
-	                const stepX = (cols > 1) ? (w / (cols - 1)) : 0;
-	                const stepY = (rows > 1) ? (h / (rows - 1)) : 0;
-	                arr.forEach((p, idx) => {
-	                  const c = idx % cols;
-	                  const r = Math.floor(idx / cols);
-	                  const x = Number(b.x) + stepX * c;
-	                  const y = Number(b.y) + stepY * r;
-	                  setPortXY(p.id, applySnap(x), applySnap(y));
-	                });
-	              };
+                const n = arr.length;
+                if (!n) return;
+                const w = Math.max(10, Number(b.w) || 0);
+                const h = Math.max(10, Number(b.h) || 0);
+
+                // Account for port size so ports stay INSIDE the box.
+                const firstRect = root.querySelector(".port-svg rect");
+                const portW = (firstRect && Number.isFinite(parseFloat(firstRect.getAttribute("width"))))
+                  ? parseFloat(firstRect.getAttribute("width"))
+                  : Number(this._config?.port_size || 18);
+                const portH = (firstRect && Number.isFinite(parseFloat(firstRect.getAttribute("height"))))
+                  ? parseFloat(firstRect.getAttribute("height"))
+                  : portW;
+
+                const spanX = Math.max(0, w - portW);
+                const spanY = Math.max(0, h - portH);
+                const ratio = (spanY > 0) ? (spanX / spanY) : spanX;
+
+                const cols = Math.max(1, Math.round(Math.sqrt(n * (ratio || 1))));
+                const rows = Math.max(1, Math.ceil(n / cols));
+                const stepX = (cols > 1) ? (spanX / (cols - 1)) : 0;
+                const stepY = (rows > 1) ? (spanY / (rows - 1)) : 0;
+
+                const baseX = Number(b.x) || 0;
+                const baseY = Number(b.y) || 0;
+
+                arr.forEach((p, idx) => {
+                  const c = idx % cols;
+                  const r = Math.floor(idx / cols);
+                  const x = baseX + stepX * c;
+                  const y = baseY + stepY * r;
+                  setPortXY(p.id, applySnap(x), applySnap(y));
+                });
+              };
 	              placeInBox(uplinks, box);
 	            }
 
@@ -2862,7 +3168,7 @@ _isCalibrationEnabled() {
 	            refreshSelCount();
 	          };
 
-	          applySmartAssist(pt1, pt2);
+	          applyAutoLayout(pt1, pt2);
 	          setMsg("Done");
 	          setTimeout(() => setMsg(""), 1200);
 	
@@ -2872,39 +3178,47 @@ _isCalibrationEnabled() {
 	        }
 	        if (isPb && pbActive) {
           // Commit ports box changes (do not persist until user clicks Save)
+          const pbWasMove = (pbKind === "move");
           pbActive = false;
           pbPid = null;
-          pbKind = null;
           pbHandle = null;
           pbStart = null;
           pbOrig = null;
+          pbMoveStartPositions = null;
+          pbResizeStartPositions = null;
           // Keep the ports box visible while the Ports box tool remains active,
           // so users can immediately grab handles to resize (same UX as Uplinks box).
           if (this._calibPortsBoxMode) setPortsBoxVisible(true);
           updatePortsBoxSvg();
-          applyPortsBoxLayout();
-          setMsg("");
+                    setMsg("");
           window.removeEventListener("pointermove", onMove);
           window.removeEventListener("pointerup", onUp);
           commitUndo();
+          pbKind = null;
           return;
         }
 
         if (isUb && ubActive) {
           // Commit uplinks box changes
+          const ubWasMove = (ubKind === "move");
           ubActive = false;
           ubPid = null;
-          ubKind = null;
           ubHandle = null;
           ubStart = null;
           ubOrig = null;
+          ubMoveStartPositions = null;
+          ubResizeStartPositions = null;
           // Do NOT persist layout editor changes until the user explicitly clicks Save.
+          // Match Ports box behavior: when finishing a draw/resize/move, tighten the
+          // box around current uplink port positions (no padding) so it hugs ports.
+          try { fitUplinkBoxToPorts(); } catch (e) {}
           updateUplinkBoxSvg();
-          applyUplinkBoxLayout();
+          // Do not auto-pack uplinks on resize/draw end; user-driven box is authoritative.
           setMsg("");
           window.removeEventListener("pointermove", onMove);
           window.removeEventListener("pointerup", onUp);
           commitUndo();
+          ubKind = null;
           return;
         }
 if (boxSelecting && boxStart) {
@@ -2961,6 +3275,32 @@ if (boxSelecting && boxStart) {
         pbHandle = handle || null;
         pbStart = pt;
         pbOrig = normBox(this._calibPortsBox) || { x: pt.x, y: pt.y, w: 240, h: 160 };
+        // If moving the Ports box, treat it as a container: move physical (non-uplink) ports with it.
+        pbMoveStartPositions = null;
+        pbResizeStartPositions = null;
+        try {
+          const uplSet = new Set(((this._config?.uplink_ports || [])).map(s => String(s).trim().toLowerCase()).filter(Boolean));
+          const gs = Array.from(svg.querySelectorAll(".port-svg[data-entity]"));
+          const map = new Map();
+          gs.forEach(g => {
+            const id = g.getAttribute("data-entity");
+            if (!id) return;
+            const nm = String(g.getAttribute("data-portname") || "").trim().toLowerCase();
+            if (uplSet.has(nm)) return; // leave uplinks to the uplinks box
+            const r = getPortRect(g);
+            if (!r) return;
+            const x = Number(r.getAttribute("x"));
+            const y = Number(r.getAttribute("y"));
+            if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+            map.set(id, { x, y });
+          });
+          if (kind === "move") pbMoveStartPositions = map;
+          if (kind === "resize") pbResizeStartPositions = map;
+        } catch (e) {
+          pbMoveStartPositions = null;
+          pbResizeStartPositions = null;
+        }
+
         setPortsBoxVisible(true);
         updatePortsBoxSvg();
         try { ev.target.setPointerCapture(ev.pointerId); } catch (e) {}
@@ -2990,6 +3330,32 @@ if (boxSelecting && boxStart) {
         ubHandle = handle || null;
         ubStart = pt;
         ubOrig = normBox(this._calibUplinkBox) || { x: pt.x, y: pt.y, w: 140, h: 100 };
+        // If moving the Uplinks box, treat it as a container: move uplink ports with it.
+        ubMoveStartPositions = null;
+        ubResizeStartPositions = null;
+        try {
+          const uplSet = new Set(((this._config?.uplink_ports || [])).map(s => String(s).trim().toLowerCase()).filter(Boolean));
+          const gs = Array.from(svg.querySelectorAll(".port-svg[data-entity]"));
+          const map = new Map();
+          gs.forEach(g => {
+            const id = g.getAttribute("data-entity");
+            if (!id) return;
+            const nm = String(g.getAttribute("data-portname") || "").trim().toLowerCase();
+            if (!uplSet.has(nm)) return;
+            const r = getPortRect(g);
+            if (!r) return;
+            const x = Number(r.getAttribute("x"));
+            const y = Number(r.getAttribute("y"));
+            if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+            map.set(id, { x, y });
+          });
+          if (kind === "move") ubMoveStartPositions = map;
+          if (kind === "resize") ubResizeStartPositions = map;
+        } catch (e) {
+          ubMoveStartPositions = null;
+          ubResizeStartPositions = null;
+        }
+
         setUplinkBoxVisible(true);
         updateUplinkBoxSvg();
         try { ev.target.setPointerCapture(ev.pointerId); } catch (e) {}
@@ -3009,7 +3375,7 @@ if (boxSelecting && boxStart) {
 
 
 	      hit.addEventListener("pointerdown", (ev) => {
-	        // Smart assist: click + drag to draw the bounds
+	        // Auto layout: click + drag to draw the bounds
 	        if (this._calibAssist === "drag") {
 	          const pt = this._svgPoint(svg, ev.clientX, ev.clientY);
 	          saDragging = true;
@@ -3075,6 +3441,7 @@ if (boxSelecting && boxStart) {
       let dragPointerId = null;
       let dragStartPt = null;
       let dragStartPositions = null;
+      let dragUplinkIds = null;
 
       const onMove = (ev) => {
         if (!dragging || dragPointerId !== ev.pointerId || !dragStartPt || !dragStartPositions) return;
@@ -3084,12 +3451,50 @@ if (boxSelecting && boxStart) {
         const dy = pt.y - dragStartPt.y;
 
         dragStartPositions.forEach((pos, id) => {
-          const x = applySnap(pos.x + dx);
-          const y = applySnap(pos.y + dy);
+          let x = applySnap(pos.x + dx);
+          let y = applySnap(pos.y + dy);
           setPortXY(id, x, y);
         });
 
-        if (elAdv?.style?.display !== "none") refreshExport();
+        // Keep the Uplinks box enclosing uplink ports while dragging (without constraining movement).
+        if (this._config?.show_uplinks_separately) {
+          try {
+            const uplSet = new Set(((this._config?.uplink_ports || [])).map(s => String(s).trim().toLowerCase()).filter(Boolean));
+            if (uplSet.size) {
+              const uplRects = Array.from(svg.querySelectorAll('.port-svg[data-entity]'))
+                .filter(g => uplSet.has(String(g.getAttribute('data-portname') || '').trim().toLowerCase()))
+                .map(g => getPortRect(g))
+                .filter(Boolean);
+
+              if (uplRects.length) {
+                let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                uplRects.forEach(r => {
+                  const x = Number(r.getAttribute('x'));
+                  const y = Number(r.getAttribute('y'));
+                  const w = Number(r.getAttribute('width'));
+                  const h = Number(r.getAttribute('height'));
+                  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h)) return;
+                  minX = Math.min(minX, x);
+                  minY = Math.min(minY, y);
+                  maxX = Math.max(maxX, x + w);
+                  maxY = Math.max(maxY, y + h);
+                });
+
+                if (Number.isFinite(minX) && Number.isFinite(minY) && Number.isFinite(maxX) && Number.isFinite(maxY)) {
+                  const pad = 0;
+                  const nx = Math.max(0, minX - pad);
+                  const ny = Math.max(0, minY - pad);
+                  const nw = Math.max(1, (maxX - minX) + (2 * pad));
+                  const nh = Math.max(1, (maxY - minY) + (2 * pad));
+                  this._calibUplinkBox = { x: nx, y: ny, w: nw, h: nh };
+                  updateUplinkBoxSvg();
+                }
+              }
+            }
+          } catch (e) {}
+        }
+
+if (elAdv?.style?.display !== "none") refreshExport();
         this._calibDirty = true;
       };
 
@@ -3100,6 +3505,7 @@ if (boxSelecting && boxStart) {
         dragPointerId = null;
         dragStartPt = null;
         dragStartPositions = null;
+        dragUplinkIds = null;
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
 
@@ -3136,11 +3542,21 @@ if (boxSelecting && boxStart) {
         dragPointerId = ev.pointerId;
         dragStartPt = this._svgPoint(svg, ev.clientX, ev.clientY);
         dragStartPositions = new Map();
+        dragUplinkIds = new Set();
+
+        // Determine which selected ports are uplinks (by Port Name match to uplink_ports).
+        const _uplinkSet = new Set(((this._config?.uplink_ports || [])).map(s => String(s).trim().toLowerCase()).filter(Boolean));
+        const _separate = !!this._config?.show_uplinks_separately;
 
         this._calibSel.forEach(selId => {
           const gg = root.querySelector(`.port-svg[data-entity="${CSS.escape(selId)}"]`);
           const xy = getGXY(gg);
           if (xy) dragStartPositions.set(selId, { x: xy.x, y: xy.y });
+
+          if (_separate && _uplinkSet.size && gg) {
+            const pn = String(gg.getAttribute("data-portname") || "").trim().toLowerCase();
+            if (pn && _uplinkSet.has(pn)) dragUplinkIds.add(selId);
+          }
         });
 
         try { g.setPointerCapture(ev.pointerId); } catch (e) {}
@@ -3218,12 +3634,12 @@ if (boxSelecting && boxStart) {
       svg[data-ssm-panel] { touch-action: none; }
       .port-svg { touch-action: none; }
       .portlabel{ font-size: ${this._config.label_size}px; color: ${this._config.label_color ? this._config.label_color : "var(--primary-text-color)"}; opacity:.85; }
-      .panel-wrap { border-radius:12px; border:1px solid var(--divider-color);
+      .panel-wrap { border-radius:12px; border:1px solid var(--divider-color); width:100%; box-sizing:border-box;
         /* Prefer HA theme vars; fall back to card background for themes that don't set --ha-card-background */
         padding:6; background: color-mix(in oklab, var(--ha-card-background, var(--card-background-color, #1f2937)) 75%, transparent); }
       /* Keep background aligned to the top so enabling labels doesn't visually "push" the image down.
          When the panel height changes (e.g., label rows), centered backgrounds will appear to shift. */
-      .panel-wrap.bg { background-repeat:no-repeat; background-position:top center; background-size:contain; }
+      .panel-wrap.bg { background-repeat:no-repeat; background-position:top center; background-size: contain; }
 
       .port-svg.calib-selected rect { stroke: rgba(255,255,255,.9); stroke-width: 2; }
       .calib-tools{ margin:12px 16px 16px 16px; padding:12px; border:1px dashed var(--divider-color); border-radius:12px; background:rgba(0,0,0,.12); }
@@ -3402,23 +3818,55 @@ if (boxSelecting && boxStart) {
       const Gv = Number(this._config.vertical_port_gap);
       const perRow = Math.max(1, this._config.ports_per_row);
       const rows = Math.max(1, Math.ceil((panelPorts.length || perRow) / perRow));
-      const W = this._config.panel_width;
-      const topPad = 24, sidePad = 28;
-      // Labels are drawn in an overlay SVG layer and should not force extra panel height.
-      // We keep a small constant bottom padding for the port area; true label overflow
-      // is handled later by expanding maxBottom only when a label would extend past
-      // the current SVG bounds.
-      const rowPad = 18;
-      let H = 20 + topPad + rows * (P + Gv) + rowPad;
+      let W = Number(this._config.panel_width);
+      if (!Number.isFinite(W)) W = 740;
+      const sidePad = 28;
+
+      const totalGridH = rows * P + Math.max(0, rows - 1) * (Number.isFinite(Gv) ? Gv : 0);
+      const labelPos = String(this._config.label_position || "below");
+      const fs0 = Math.max(8, Number(this._config.label_size) || 8);
+      // Reserve a little space for below-labels so they don’t clip. For inside/above, minimal padding.
+      const labelPad = (this._config.show_labels && (labelPos !== "inside") && (labelPos !== "above") && (labelPos !== "split"))
+        ? (fs0 + 10)
+        : 12;
+
+      const totalRowW = perRow * P + Math.max(0, (perRow - 1)) * (Number.isFinite(Gh) ? Gh : 0);
+
+      if (W <= 0) {
+        // Panel width = 0 means "auto".
+        // IMPORTANT:
+        // - The SVG is rendered at width="100%" (responsive to the card's available space).
+        // - If we compute a *small* viewBox width from the port grid, the browser will scale that
+        //   small viewBox up to the available width, which also scales the height and creates the
+        //   huge empty vertical space you observed in auto mode.
+        //
+        // So, in auto mode, keep a sane, "screen-like" baseline viewBox width. The browser will
+        // scale it to the available width, but the viewBox aspect remains stable so the background
+        // image stays in aspect and we avoid the bottom gap.
+        W = 980;
+      }
+
+      // Panel height:
+      // - If a background image is configured and we know its aspect ratio, match panel height
+      //   to preserve the image aspect (no stretching and no unnecessary letterboxing).
+      // - Otherwise fall back to content-driven height.
+      let H = Math.max(140, Math.ceil(totalGridH + labelPad + 48));
+      if (useBg) {
+        try { this._maybeLoadBgAspect(); } catch (e) {}
+        const asp = this._bgAspectByUrl.get(String(this._config.background_image || "").trim());
+        if (Number.isFinite(asp) && asp > 0 && Number.isFinite(W) && W > 0) {
+          H = Math.max(140, Math.round(W / asp));
+        }
+      }
+
+      // Center ports vertically within the panel.
+      let topPad = Math.max(12, Math.floor((H - totalGridH - labelPad) / 2));
       let maxBottom = H;
-      const plate = useBg ? "" : `<rect x="10" y="10" width="${W - 20}" height="${H - 20}" rx="8"
-        fill="var(--ha-card-background, var(--card-background-color, #1f2937))" stroke="var(--divider-color, #4b5563)"/>`;
-
+      let maxRight = W;
+      let plate = "";
 const usableW = W - 2 * sidePad;
-      const totalRowW = perRow * P + Math.max(0, (perRow - 1)) * Gh;
-      const startX = sidePad + Math.max(0, (usableW - totalRowW) / 2);
-
-      // Optional per-port positioning overrides (panel view)
+const startX = sidePad + Math.max(0, (usableW - totalRowW) / 2);
+		// Optional per-port positioning overrides (panel view)
       // Map keys are interface Names (e.g. "Gi1/0/1"). Matching is case-insensitive.
       // When calibration mode is enabled we may have a live (in-memory) map that differs from
       // config.port_positions. Use the live map so drag/drop doesn't snap back on refresh.
@@ -3457,7 +3905,7 @@ const usableW = W - 2 * sidePad;
 
           const _idx = _i % perRow, _row = Math.floor(_i / perRow);
           let _x = startX + _idx * (P + Gh);
-          let _y = topPad + _row * (P + Gv) + 18;
+          let _y = topPad + _row * (P + Gv) ;
 
           if (portPos) {
             const _key = String(_name).trim().toLowerCase();
@@ -3489,7 +3937,7 @@ const usableW = W - 2 * sidePad;
         const alias = a.Alias;
         const idx = i % perRow, row = Math.floor(i / perRow);
         let x = startX + idx * (P + Gh);
-        let y = topPad + row * (P + Gv) + 18;
+        let y = topPad + row * (P + Gv) ;
 
         // Apply explicit position override if provided (values are SVG coords for the port's top-left).
         if (portPos) {
@@ -3512,6 +3960,7 @@ const usableW = W - 2 * sidePad;
 // (Label extents are accounted for after label geometry is computed.)
 if (Number.isFinite(y) && Number.isFinite(Ps)) {
   maxBottom = Math.max(maxBottom, y + Ps + 12);
+  maxRight = Math.max(maxRight, x + Ps + 12);
 }
         const labelColor = this._config.label_color || this._config.label_font_color || "var(--primary-text-color)";
         const labelBg = this._config.label_bg_color || this._config.label_background_color || "";
@@ -3523,15 +3972,15 @@ if (Number.isFinite(y) && Number.isFinite(Ps)) {
             if (!numbersOnly) return rawNm;
             const s = rawNm;
             // Numbers-only labels: choose source
-            const from = (this._config.label_numbers_from || "index");
+            const from = String(this._config.label_numbers_from ?? "index").toLowerCase();
             if (from === "index") {
               const ifidx = (a.Index ?? a.IfIndex ?? a.ifIndex ?? a.ifindex ?? null);
               const v = Number.isFinite(Number(ifidx)) ? Number(ifidx) : (i + 1);
               return String(v);
             }
-            // Port name: use the right-most trailing digits (e.g. "2.5G 12" -> "12", "Gi1/0/47" -> "47")
-            const m = s.match(/(\d+)\s*$/);
-            return m ? m[1] : s;
+            // Port name: use the right-most number anywhere in the port name (e.g. "GigabitEthernet 3" -> "3", "Gi1/0/47" -> "47")
+            const nums = s.match(/\d+/g);
+            return (nums && nums.length) ? nums[nums.length - 1] : s;
           })();
           // Make the background as tight as practical while staying readable.
           // SVG text is proportional; this is an estimate, not a measurement.
@@ -3573,7 +4022,7 @@ if (Number.isFinite(y) && Number.isFinite(Ps)) {
           const textY = isInside ? (y + Ps / 2 + insideNudge) : (rectY + fs + padY - 0.5);
           const dominant = isInside ? "middle" : "alphabetic";
 
-          labels.push(`${bgRect}<text class="portlabel" data-entity="${id}" x="${textX}" y="${textY}" text-anchor="middle" dominant-baseline="${dominant}" style="${(this._config.label_numbers_only && this._config.label_outline) ? 'paint-order:stroke fill;stroke:#000;stroke-width:2px;stroke-linejoin:round;' : ''} pointer-events:none; fill:${labelColor};" fill="${labelColor}">${nm}</text>`);
+          labels.push(`${bgRect}<text class="portlabel" data-entity="${id}" x="${textX}" y="${textY}" text-anchor="middle" dominant-baseline="${dominant}" style="${(this._config.label_outline) ? 'paint-order:stroke fill;stroke:#000;stroke-width:2px;stroke-linejoin:round;' : ''} pointer-events:none; fill:${labelColor};" fill="${labelColor}">${nm}</text>`);
         }
         const titleParts = [];
         if (alias) titleParts.push(`${alias}`);
@@ -3590,8 +4039,36 @@ if (Number.isFinite(y) && Number.isFinite(Ps)) {
       // Expand viewBox height if custom positions extend beyond the default grid.
       H = Math.max(H, Math.ceil(maxBottom));
 
+      // Expand viewBox width if custom positions or Layout Editor boxes extend beyond the default grid.
+      // IMPORTANT: when Panel width is 0 (auto), expanding the viewBox during editing changes the
+      // scale between Layout Editor and normal view, which makes ports appear to “move/resize”
+      // after exiting the editor. So only expand for boxes when the user has an explicit panel width.
+      const _panelWCfg = Number(this._config.panel_width);
+      if (this._isCalibrationEnabled() && Number.isFinite(_panelWCfg) && _panelWCfg > 0) {
+        const bump = (b) => {
+          if (!b || typeof b !== "object") return;
+          const bx = Number(b.x), by = Number(b.y), bw = Number(b.w), bh = Number(b.h);
+          if (Number.isFinite(bx) && Number.isFinite(bw)) maxRight = Math.max(maxRight, bx + bw + 20);
+          if (Number.isFinite(by) && Number.isFinite(bh)) maxBottom = Math.max(maxBottom, by + bh + 20);
+        };
+        bump(this._calibPortsBox);
+        bump(this._calibUplinkBox);
+      }
+      W = Math.max(W, Math.ceil(maxRight));
+      H = Math.max(H, Math.ceil(maxBottom));
+
+      plate = useBg ? "" : `<rect x="10" y="10" width="${W - 20}" height="${H - 20}" rx="8"
+        fill="var(--ha-card-background, var(--card-background-color, #1f2937))" stroke="var(--divider-color, #4b5563)"/>`;
+
+      const _panelAuto = (Number(this._config.panel_width) <= 0);
+      const _wrapStyles = [];
+      if (useBg) _wrapStyles.push(`background-image:url(${bgUrl})`);
+      // In auto mode, do NOT force an explicit pixel width on the panel wrapper.
+      // We want it to naturally fill the available card width (responsive), matching fixed-width behavior.
+      const _wrapStyleAttr = _wrapStyles.length ? ` style="${_wrapStyles.join(';')}"` : "";
+
       const svg = `
-        <div class="panel-wrap${useBg ? " bg" : ""}"${useBg ? ` style="background-image:url(${bgUrl})"` : ""}>
+        <div class="panel-wrap${useBg ? " bg" : ""}"${_wrapStyleAttr}>
           <svg data-ssm-panel="1" viewBox="0 0 ${W} ${H}" width="100%" height="auto" preserveAspectRatio="xMidYMid meet">
 
             ${this._isCalibrationEnabled() ? `
@@ -4138,6 +4615,30 @@ connectedCallback() {
         return null;
       }
 
+
+_allSupportedSpeedLabels() {
+  const palette = this._defaultSpeedPalette();
+  const labels = new Set(Object.keys(palette || {}));
+  labels.add("Disconnected");
+  labels.add("Admin Down");
+
+  // Sort ascending by Mbps
+  const toMbps = (lab) => {
+    if (typeof lab === "number") return lab;
+    if (lab === "Admin Down") return -2;
+    if (lab === "Admin Down") return -2;
+    if (lab === "Disconnected") return -1;
+    const s = String(lab);
+    const m = s.match(/^([0-9]+(?:\.[0-9]+)?)\s*(M|G)bps$/i);
+    if (!m) return Number.POSITIVE_INFINITY;
+    const v = parseFloat(m[1]);
+    const unit = m[2].toLowerCase();
+    return unit === "g" ? v * 1000 : v;
+  };
+
+  return Array.from(labels).sort((a, b) => toMbps(a) - toMbps(b));
+}
+
 _detectedSpeedLabels(devicePrefix) {
   const hass = this._hass;
   const labels = new Set();
@@ -4176,6 +4677,7 @@ _detectedSpeedLabels(devicePrefix) {
     return unit === "g" ? v * 1000 : v;
   };
     labels.add("Disconnected");
+  labels.add("Admin Down");
   return Array.from(labels).sort((a, b) => toMbps(a) - toMbps(b));
 }
 
@@ -4221,7 +4723,7 @@ _detectedSpeedLabels(devicePrefix) {
       _renderSpeedColorsSection(c) {
         const palette = this._defaultSpeedPalette();
         const overrides = (c.speed_colors && typeof c.speed_colors === "object") ? c.speed_colors : {};
-        const labels = this._detectedSpeedLabels(c.device);
+        const labels = (c.show_all_speeds === true) ? this._allSupportedSpeedLabels() : this._detectedSpeedLabels(c.device);
 
         const items = labels.map((lab) => {
           const o = (typeof overrides[lab] === "string" && overrides[lab].trim())
@@ -4252,7 +4754,12 @@ _detectedSpeedLabels(devicePrefix) {
                 <ha-icon icon="mdi:restore"></ha-icon>
               </button>
             </div>
-            <div class="hint">Colors are based on the switch's normalized speed labels. Only speeds detected on the selected device are shown (or across all devices when none is selected).</div>
+            
+            <div class="row inline" style="align-items:center;gap:10px;margin-top:8px;">
+              <label for="show_all_speeds" style="margin:0;">Show all speeds</label>
+              <ha-switch id="show_all_speeds"${c.show_all_speeds ? " checked" : ""}></ha-switch>
+            </div>
+            <div class="hint">Colors are based on the switch's normalized speed labels. When "Show all speeds" is on, the full supported set is shown even if the device hasn’t reported that speed yet.</div>
             <div class="colorGrid">${items}</div>
           </div>
         `;
@@ -4879,7 +5386,7 @@ details.section > summary::after{
                   </div>
                   <div class="row">
                     <div class="rowhead"><label for="panel_width">Panel width</label><div class="helpiconbtn" data-help-title="Panel width" data-help="panel_width"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
-                    <input id="panel_width" type="number" min="200" value="${(this._editingFields?.has('panel_width') && this._draftValues?.panel_width != null) ? this._draftValues.panel_width : (c.panel_width != null ? Number(c.panel_width) : 740)}"${c.view === "list" ? " disabled" : ""}>
+                    <input id="panel_width" type="number" min="0" value="${(this._editingFields?.has('panel_width') && this._draftValues?.panel_width != null) ? this._draftValues.panel_width : (c.panel_width != null ? Number(c.panel_width) : 740)}"${c.view === "list" ? " disabled" : ""}>
                   </div>
                 ` : ""}</div>
 
@@ -4966,10 +5473,10 @@ details.section > summary::after{
 </div>
 <div class="row inline" style="gap:10px; align-items:center;">
   <div class="rowhead" style="display:flex; align-items:center; gap:6px; flex:1 1 auto;">
-    <label for="label_outline" style="margin:0;">Outline port numbers</label>
-    <div class="helpiconbtn" data-help-title="Outline port numbers" data-help="label_outline"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div>
+    <label for="label_outline" style="margin:0;">Outline port labels</label>
+    <div class="helpiconbtn" data-help-title="Outline port labels" data-help="label_outline"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div>
   </div>
-  <ha-switch id="label_outline"${c.label_outline ? " checked" : ""}${c.show_labels === false || c.view === "list" || c.label_numbers_only !== true ? " disabled" : ""}></ha-switch>
+  <ha-switch id="label_outline"${c.label_outline ? " checked" : ""}${c.show_labels === false || c.view === "list" ? " disabled" : ""}></ha-switch>
 </div>
 ` : ""}${c.view === "panel" ? `
 <div class="row">
@@ -5165,7 +5672,7 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
         });
         root.getElementById("panel_width")?.addEventListener("change", (ev) => {
           const v = parseInt(ev.target.value, 10);
-          this._updateConfig("panel_width", (Number.isFinite(v) && v > 0) ? v : 740);
+          this._updateConfig("panel_width", (Number.isFinite(v) && v >= 0) ? v : 740);
         });
         // Drafted number inputs (avoid HA editor re-renders clobbering typing)
         const bindDraftNumber = (id, key, fallback, parseFn) => {
@@ -5203,7 +5710,7 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
         });
         bindDraftNumber("panel_width", "panel_width", 740, (raw) => {
           const n = parseInt(String(raw ?? "").trim(), 10);
-          return Number.isFinite(n) && n >= 200 ? n : 740;
+          return Number.isFinite(n) && n >= 0 ? n : 740;
         });
         bindDraftNumber("gap", "gap", 10, (raw) => {
           const n = parseInt(String(raw ?? "").trim(), 10);
@@ -5228,6 +5735,13 @@ root.getElementById("device")?.addEventListener("change", (ev) => {
 
         root.getElementById("speed_click_opens_graph")?.addEventListener("change", (ev) => {
           this._updateConfig("speed_click_opens_graph", !!ev.target.checked);
+        });
+
+        // Speed colors: show full supported speeds list
+        root.getElementById("show_all_speeds")?.addEventListener("change", (ev) => {
+          this._updateConfig("show_all_speeds", !!ev.target.checked);
+          this._rendered = false;
+          this._render();
         });
 
         // Reset buttons (icon buttons in section headers)
@@ -5455,13 +5969,14 @@ root.getElementById("vertical_port_gap")?.addEventListener("change", (ev) => {
         });
 
         root.getElementById("label_numbers_only")?.addEventListener("change", (ev) => {
-          this._updateConfig("label_numbers_only", !!ev.target.checked);
+  this._updateConfig("label_numbers_only", !!ev.target.checked);
+  this._render(); // show/hide dependent fields immediately
+});
 
-        root.getElementById("label_numbers_from")?.addEventListener("change", (ev) => {
-          this._updateConfig("label_numbers_from", String(ev.target.value || "index"));
-        });
-        });
-// Outline port numbers (only used when "Port labels by number" is enabled)
+root.getElementById("label_numbers_from")?.addEventListener("change", (ev) => {
+  this._updateConfig("label_numbers_from", String(ev.target.value || "index"));
+  // no full re-render needed; labels update during normal redraw
+});// Outline port labels (only used when "Port labels by number" is enabled)
 root.getElementById("label_outline")?.addEventListener("change", (ev) => {
   this._updateConfig("label_outline", ev.target.checked === true);
 });
@@ -5796,11 +6311,11 @@ root.getElementById("label_outline")?.addEventListener("change", (ev) => {
   },
   uplink_ports: {
     title: "Uplink ports",
-    text: "Select uplink ports so Smart Assist and the Layout Editor can keep them separate from the main port grid (if enabled)."
+    text: "Select uplink ports so Ports and Uplinks mode and the Layout Editor can keep them separate from the main port grid (if enabled)."
   },
   uplinks: { // backward-compatible key
     title: "Uplink ports",
-    text: "Select uplink ports so Smart Assist and the Layout Editor can keep them separate from the main port grid (if enabled)."
+    text: "Select uplink ports so Ports and Uplinks mode and the Layout Editor can keep them separate from the main port grid (if enabled)."
   },
   hide_ports: {
     title: "Hide ports",
@@ -5832,7 +6347,7 @@ label_numbers_from: {
 },
 
 label_outline: {
-  title: "Outline port numbers",
+  title: "Outline port labels",
   text: "Adds a black outline around numeric port labels to improve readability on bright backgrounds. This only applies when \"Port labels by number\" is enabled."
 },
 
