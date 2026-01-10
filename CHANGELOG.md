@@ -308,3 +308,36 @@ This beta release introduces a significantly refined card editor experience, a m
   - Works transparently in both **Attributes** and **Sensors** modes
 
 ---
+
+## [0.4.0] – 2026-01-10
+### Added
+- 🎨 **Speed color mode enhancements**
+  - New **Show all supported speeds** option
+  - **Admin Down** color is always available and takes precedence over:
+    - Speed color
+    - Disconnected color
+- 🏷️ **Improved label controls**
+  - Renamed **“Outline port numbers” → “Outline port labels”**
+  - Outline applies to **all label types**, not just numeric labels
+  - Option is available whenever port labels are enabled
+
+### Improved
+- 🖥️ **Automatic panel scaling**
+  - When **Panel width = 0**, the card automatically scales to available dashboard space
+  - Background images retain correct aspect ratio
+  - Panel height is derived from actual content, eliminating unused vertical space
+  - Exiting the Layout Editor no longer changes port size or position
+- 🎯 **Ports vs Uplinks consistency**
+  - Uplinks layout now behaves identically to Ports layout in all editor interactions
+- 🔢Numeric input controls are usable on high-resolution (4K) displays
+- 🖱️ By default and after a reset, the ports are now centered in the panel
+- 🖱️ Virtual and Physical interface detection is now performed by the integration for greater accuracy and now inserts a Port Type attribute that this card reads
+
+### Fixed
+- 🐞 **Interface Name Recognition**
+  - Interfaces now display on the card no matter what their names are
+- 🐞 **Numbers from**
+  - This setting was stuck to Index and never switched to Port name
+- 🐞 **Layout Editor**
+  - The Ports and Uplinks boxes can no longer extend beyond the panel edges
+  - Port gap settings do not add margin to the leftmost, rightmost, topmost, or bottommost ports
