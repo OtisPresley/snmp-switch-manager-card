@@ -341,3 +341,13 @@ This beta release introduces a significantly refined card editor experience, a m
 - 🐞 **Layout Editor**
   - The Ports and Uplinks boxes can no longer extend beyond the panel edges
   - Port gap settings do not add margin to the leftmost, rightmost, topmost, or bottommost ports
+
+---
+
+## [0.4.1-beta.1] – 2026-01-11
+### Fixed
+- 🐞 **Layout Editor Save**
+  - The Layout Editor was not saving port positions reliably
+- 🐞 **Layout Editor Autoscale**
+  - The Layout Editor was not autoscaling properly when **Port scale** is set to 0
+  - There will be a bit more vertical margin that is unavoidable when autoscaling
