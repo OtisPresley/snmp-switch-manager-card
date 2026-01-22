@@ -351,3 +351,25 @@ This beta release introduces a significantly refined card editor experience, a m
 - 🐞 **Layout Editor Autoscale**
   - The Layout Editor was not autoscaling properly when **Port scale** is set to 0
   - There will be a bit more vertical margin that is unavoidable when autoscaling
+
+---
+
+## [0.4.1-beta.2] – 2026-01-22
+### Fixed
+- 🎨 **Admin Down color reliability**
+  - Admin Down ports now always render using the configured default color in **Speed** mode
+  - No longer requires manually touching the color picker to force the correct color
+  - Color application is now robust regardless of attribute casing or formatting
+
+- 🧭 **Layout Editor centering improvements**
+  - Ports are now correctly **centered vertically and horizontally** by default after a reset
+  - Label enable/disable no longer causes unexpected vertical shifts in the port layout
+
+- 🧩 **Layout Editor stability**
+  - Resetting port positions now consistently produces a valid layout every time
+  - Prevents intermittent failures where Reset would not visibly apply
+
+### Notes
+- Attempts to introduce continuous auto-reflow of ports after Reset (without re-pressing Reset)
+  were intentionally **abandoned** due to Home Assistant editor lifecycle limitations.
+- Existing behavior has been preserved to avoid regressions or unintended layout persistence.
