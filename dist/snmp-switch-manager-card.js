@@ -327,6 +327,16 @@ _setLayoutEditorSessionClosed() {
     if (!this._config.calibration_mode) this._calibUiClosed = false;
     else if (!prevCalib && this._config.calibration_mode) this._calibUiClosed = false;
 
+    // While the Layout Editor is open, HA's editor preview can recreate/re-render the card when
+    // config fields change (e.g., port gap). If the user has unsaved layout work (Reset positions
+    // or manual moves), persist a DRAFT to localStorage so the preview doesn't snap back to the
+    // last saved layout.
+    try {
+      if (this._isCalibrationEnabled() && (this._calibDirty || this._calibAutoGridEnabled)) {
+        this._persistCalibDraftToStorage();
+      }
+    } catch (e) {}
+
     this._safeRender();
 }
 
@@ -628,9 +638,8 @@ _setLayoutEditorSessionClosed() {
 
           const attrs = st.attributes;
           const looksRight =
-            (attrs.Index !== undefined || attrs.Name) ||
-            /^switch\.(?:gi|te|tw)\d+_\d+_\d+$/i.test(id) ||
-            /^switch\.(?:vl\d+|lo\d+|po\d+)$/i.test(id);
+            (attrs.Index !== undefined || attrs.Name != null ||
+             attrs["Port Type"] != null || attrs.PortType != null || attrs.port_type != null || attrs.portType != null);
           if (!looksRight) return false;
 
           // Preferred scoping: device hostname prefix (switch.<device>_*)
@@ -738,7 +747,7 @@ _setLayoutEditorSessionClosed() {
       "50 Gbps": "#d946ef",      // fuchsia
       "100 Gbps": "#ec4899",     // pink
       "Disconnected": "#ef4444", // red (was Unknown)
-      "Admin Down": "#6b7280",   // gray (admin disabled)
+      "Admin Down": "#ef4444",   // gray (admin disabled)
       "Unknown": "#ef4444",      // legacy key
     };
   }
@@ -820,8 +829,24 @@ _setLayoutEditorSessionClosed() {
       const attrs = st?.attributes || null;
 
       // Admin Down should win over speed/disconnected.
-      const adminRaw = (attrs?.Admin ?? attrs?.admin_status ?? attrs?.admin ?? attrs?.ifAdminStatus ?? "").toString().toLowerCase();
-      const operRaw = (attrs?.Oper ?? attrs?.oper_status ?? attrs?.oper ?? attrs?.ifOperStatus ?? "").toString().toLowerCase();
+      const _getAttr = (o, candidates) => {
+        if (!o || typeof o !== "object") return "";
+        // 1) Direct lookups
+        for (const k of candidates) {
+          if (k in o) return o[k];
+        }
+        // 2) Normalized (case/space/underscore-insensitive) lookups
+        const want = candidates.map(x => String(x).toLowerCase().replace(/[^a-z0-9]/g, ""));
+        for (const [k, v] of Object.entries(o)) {
+          const nk = String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
+          const idx = want.indexOf(nk);
+          if (idx !== -1) return v;
+        }
+        return "";
+      };
+
+      const adminRaw = String(_getAttr(attrs, ["Admin", "admin_status", "admin", "ifAdminStatus", "adminstatus", "admin_status_text", "if_admin_status", "adminState", "admin_state"]) || "").toLowerCase();
+      const operRaw = String(_getAttr(attrs, ["Oper", "oper_status", "oper", "ifOperStatus", "operstatus", "oper_status_text", "if_oper_status", "operState", "oper_state"]) || "").toLowerCase();
       const isAdminDown = adminRaw.includes("down") || adminRaw.includes("disabled") || adminRaw.includes("false") || adminRaw.includes("0");
       const isOperDown = operRaw.includes("down") || operRaw.includes("lowerlayerdown") || operRaw.includes("notpresent") || operRaw.includes("dormant") || operRaw.includes("unknown") || operRaw.includes("false") || operRaw.includes("0");
 
@@ -833,7 +858,12 @@ _setLayoutEditorSessionClosed() {
       const overrideColor = overrides && typeof overrides === "object" ? overrides[label] : null;
       if (typeof overrideColor === "string" && overrideColor.trim()) return overrideColor.trim();
 
-      // Default palette.
+      // Default palette (case-insensitive key match for robustness across integrations).
+      const _lbl = (label != null) ? String(label) : "";
+      if (_lbl) {
+        const _k = Object.keys(palette).find(k => String(k).toLowerCase() === _lbl.toLowerCase());
+        if (_k && palette[_k]) return palette[_k];
+      }
       return palette[label] || palette["Disconnected"];
     }
 
@@ -1654,6 +1684,10 @@ renderGraph(force);
     return `ssm_calib_v2:${prefix}:${bg}`;
   }
 
+  _calibDraftStorageKey() {
+    return `${this._calibStorageKey()}:draft`;
+  }
+
   _inferDeviceStorageId() {
     const cfg = this._config || {};
     if (cfg.device) return String(cfg.device);
@@ -1662,10 +1696,26 @@ renderGraph(force);
     const ae = cfg.anchor_entity ? String(cfg.anchor_entity) : "";
     if (ae) return ae.includes(".") ? ae.split(".")[1] : ae;
 
+    // Fallback: use device_name if provided (stable across renders, unlike ports which may
+    // not be discovered yet in the editor preview when config changes).
+    if (cfg.device_name) return String(cfg.device_name);
+
     // Last resort: try to derive from the first discovered physical port entity id.
     const ports = Array.isArray(this._ports) ? this._ports : [];
     const ent0 = ports.find(p => p && p.entity_id)?.entity_id || "";
     if (ent0) return ent0.includes(".") ? ent0.split(".")[1] : ent0;
+
+    // Fallback: unit/slot scoping (if user configured a specific chassis slice).
+    if (Number.isFinite(cfg.unit) || Number.isFinite(cfg.slot)) {
+      const u = Number.isFinite(cfg.unit) ? String(cfg.unit) : "";
+      const s = Number.isFinite(cfg.slot) ? String(cfg.slot) : "";
+      const tag = [u, s].filter(Boolean).join("-");
+      if (tag) return `unit-slot-${tag}`;
+    }
+
+    // Fallback: physical scoping hints.
+    if (cfg.physical_regex) return `re-${String(cfg.physical_regex)}`;
+    if (cfg.physical_prefixes) return `px-${String(cfg.physical_prefixes)}`;
 
     return "";
   }
@@ -1674,7 +1724,8 @@ renderGraph(force);
   _loadCalibMapFromStorage() {
     try {
       const keyV3 = this._calibStorageKey();
-      let raw = localStorage.getItem(keyV3);
+      const keyDraft = this._calibDraftStorageKey();
+      let raw = localStorage.getItem(keyDraft) || localStorage.getItem(keyV3);
 
       // Try legacy v2 storage if present. Only migrate it if it actually matches this device's ports.
       if (!raw) {
@@ -1758,6 +1809,31 @@ renderGraph(force);
       localStorage.setItem(key, JSON.stringify(obj));
     } catch (e) {}
   }
+
+  _persistCalibDraftToStorage() {
+    try {
+      const key = this._calibDraftStorageKey();
+      const map = (this._calibMap && typeof this._calibMap === "object") ? this._calibMap : {};
+      const vb = (this._ssmLastViewBox && typeof this._ssmLastViewBox === "object") ? this._ssmLastViewBox : null;
+      const vbw = vb ? Number(vb.w) : NaN;
+      const vbh = vb ? Number(vb.h) : NaN;
+      const obj = {
+        v: 2,
+        ts: Date.now(),
+        map,
+        uplink_box: (this._calibUplinkBox && typeof this._calibUplinkBox === "object") ? this._calibUplinkBox : null,
+        ports_box: (this._calibPortsBox && typeof this._calibPortsBox === "object") ? this._calibPortsBox : null,
+        ports_order: (typeof this._calibPortsOrder === "string") ? this._calibPortsOrder : null,
+        viewbox: (Number.isFinite(vbw) && vbw > 0 && Number.isFinite(vbh) && vbh > 0) ? { w: vbw, h: vbh } : null,
+      };
+      localStorage.setItem(key, JSON.stringify(obj));
+    } catch (e) {}
+  }
+
+  _clearCalibDraftFromStorage() {
+    try { localStorage.removeItem(this._calibDraftStorageKey()); } catch (e) {}
+  }
+
 
   _persistCalibMapDebounced() {
     // IMPORTANT: Do NOT persist layout positions automatically.
@@ -2661,6 +2737,14 @@ const fitPortsBoxToPorts = () => {
       // We clear the in-memory overrides, then re-apply the default grid layout
       // to the current SVG and regenerate the JSON from those new positions.
       this._calibMap = {};
+      // Mark this layout as auto-generated so gap/per-row/order changes can re-pack automatically.
+      this._calibAutoGridEnabled = true;
+      this._calibAutoGridMeta = {
+        horizontal_port_gap: Number(this._config?.horizontal_port_gap),
+        vertical_port_gap: Number(this._config?.vertical_port_gap),
+        ports_per_row: parseInt(this._config?.ports_per_row, 10) || 0,
+        ports_order: String(this._calibPortsOrder || "numeric"),
+      };
 
       try {
         const gs = Array.from(root.querySelectorAll(".port-svg[data-entity]"));
@@ -2671,7 +2755,17 @@ const fitPortsBoxToPorts = () => {
         const Gh = Number(this._config?.horizontal_port_gap);
         const Gv = Number(this._config?.vertical_port_gap);
         const perRow = Math.max(1, parseInt(this._config?.ports_per_row, 10) || 24);
-        const W = Number((this._config?.panel_width ?? 1440));
+        // Use the actual current panel width (viewBox) when Panel width is set to 0 (auto).
+        // Using config.panel_width directly would be 0 and causes bad centering calculations.
+        let W = Number((this._config?.panel_width ?? 1440));
+        if (!Number.isFinite(W) || W <= 0) {
+          try {
+            const svg = root.querySelector("svg");
+            const vb = svg?.viewBox?.baseVal;
+            if (vb && Number.isFinite(vb.width) && vb.width > 0) W = vb.width;
+          } catch (e) {}
+        }
+        if (!Number.isFinite(W) || W <= 0) W = 1440;
         const sidePad = 28;
         const topPad = 24;
         const usableW = W - 2 * sidePad;
@@ -2680,6 +2774,8 @@ const fitPortsBoxToPorts = () => {
 
         // Apply to each visible port in DOM order (matches the rendered order).
         let i = 0;
+        this._calibApplyingAutoLayout = true;
+        const nextMap = {};
         gs.forEach((g) => {
           const id = String(g.getAttribute("data-entity") || "").trim();
           if (!id) return;
@@ -2688,8 +2784,20 @@ const fitPortsBoxToPorts = () => {
           const x = startX + col * (P + (Number.isFinite(Gh) ? Gh : 0));
           const y = topPad + row * (P + (Number.isFinite(Gv) ? Gv : 0)) + 18;
           setPortXY(id, applySnap(x), applySnap(y));
+          const pn = String(g.getAttribute("data-portname") || "").trim() || id;
+          const entSuffix = String(id.split(".")[1] || "").trim();
+          // Store by port display name AND entity suffix to avoid any dependency on naming conventions.
+          // This makes reset+gap changes stable even if Name rules change.
+          nextMap[pn] = { x: applySnap(x), y: applySnap(y) };
+          if (entSuffix) nextMap[entSuffix] = { x: applySnap(x), y: applySnap(y) };
           i++;
         });
+        this._calibApplyingAutoLayout = false;
+
+        // Ensure the live calibration map reflects the reset grid so subsequent config changes
+        // (gap/per-row/order) don't snap back to the last saved layout.
+        this._calibMap = nextMap;
+        try { this._persistCalibDraftToStorage(); } catch (e) {}
 
         // Also clear selection when doing a full reset.
         this._calibSel?.clear?.();
@@ -2703,6 +2811,7 @@ const fitPortsBoxToPorts = () => {
       }
 
       refreshExport();
+      this._persistCalibDraftToStorage();
     });
 
 
@@ -2711,6 +2820,7 @@ const fitPortsBoxToPorts = () => {
 // Persist locally for immediate UX, and also emit an event so the editor can
 // write the positions back into the card config (so it survives reloads).
 this._persistCalibMapToStorage();
+this._clearCalibDraftFromStorage();
 
 const safeMap = (this._calibMap && typeof this._calibMap === "object") ? this._calibMap : {};
 
@@ -3639,8 +3749,9 @@ if (elAdv?.style?.display !== "none") refreshExport();
 
         // Track in-memory undo history for any drag/move operations.
         beginUndo();
-
-        // Begin group drag for current selection
+        // Manual moves disable auto grid re-packing.
+        if (!this._calibApplyingAutoLayout) this._calibAutoGridEnabled = false;
+// Begin group drag for current selection
         dragging = true;
         dragPointerId = ev.pointerId;
         dragStartPt = this._svgPoint(svg, ev.clientX, ev.clientY);
@@ -3736,7 +3847,7 @@ if (elAdv?.style?.display !== "none") refreshExport();
       svg { display:block; }
       svg[data-ssm-panel] { touch-action: none; }
       .port-svg { touch-action: none; }
-      .portlabel{ font-size: ${this._config.label_size}px; color: ${this._config.label_color ? this._config.label_color : "var(--primary-text-color)"}; opacity:.85; }
+      .portlabel{ font-size: var(--ssm-label-size, ${this._config.label_size}px); color: ${this._config.label_color ? this._config.label_color : "var(--primary-text-color)"}; opacity:.85; }
       .panel-wrap { border-radius:12px; border:1px solid var(--divider-color); width:100%; box-sizing:border-box;
         /* Prefer HA theme vars; fall back to card background for themes that don't set --ha-card-background */
         padding:6px; background: color-mix(in oklab, var(--ha-card-background, var(--card-background-color, #1f2937)) 75%, transparent); }
@@ -3929,7 +4040,9 @@ if (elAdv?.style?.display !== "none") refreshExport();
 
       const useBg = !!this._config.background_image;
       const bgUrl = useBg ? this._htmlEscape(this._config.background_image) : "";
-      const scale = (Number.isFinite(this._config.ports_scale) && this._config.ports_scale > 0) ? this._config.ports_scale : 1;
+      const _scaleCfg = Number(this._config.ports_scale);
+      const _autoScaleRequested = (Number.isFinite(_scaleCfg) && _scaleCfg === 0);
+      let scale = (Number.isFinite(_scaleCfg) && _scaleCfg > 0) ? _scaleCfg : 1;
       const offX = Number.isFinite(this._config.ports_offset_x) ? this._config.ports_offset_x : 0;
       const offY = Number.isFinite(this._config.ports_offset_y) ? this._config.ports_offset_y : 0;
 
@@ -3937,35 +4050,53 @@ if (elAdv?.style?.display !== "none") refreshExport();
       const P = this._config.port_size;
       const Gh = Number(this._config.horizontal_port_gap);
       const Gv = Number(this._config.vertical_port_gap);
-      const perRow = Math.max(1, this._config.ports_per_row);
-      const rows = Math.max(1, Math.ceil((panelPorts.length || perRow) / perRow));
+      const perRowCfg = Math.max(1, this._config.ports_per_row);
+
+      // Use actual port count for sizing so "Ports per row" doesn't reserve space for non-existent ports.
+      const portCount = Math.max(1, panelPorts.length || 1);
+      const perRowUsed = Math.max(1, Math.min(perRowCfg, portCount));
+      const rows = Math.max(1, Math.ceil(portCount / perRowUsed));
+
       let W = Number(this._config.panel_width);
       if (!Number.isFinite(W)) W = 740;
       const sidePad = 28;
 
-      const totalGridH = rows * P + Math.max(0, rows - 1) * (Number.isFinite(Gv) ? Gv : 0);
       const labelPos = String(this._config.label_position || "below");
-      const fs0 = Math.max(8, Number(this._config.label_size) || 8);
-      // Reserve a little space for below-labels so they don’t clip. For inside/above, minimal padding.
-      const labelPad = (this._config.show_labels && (labelPos !== "inside") && (labelPos !== "above") && (labelPos !== "split"))
-        ? (fs0 + 10)
-        : 12;
 
-      const totalRowW = perRow * P + Math.max(0, (perRow - 1)) * (Number.isFinite(Gh) ? Gh : 0);
+
+      // Detect whether we have explicit per-port positions; autoscaling the GRID shouldn't fight custom positions.
+      // NOTE: This must be computed before auto panel sizing so we can decide whether to honor a stored viewBox.
+      const _stored = this._loadCalibMapFromStorage();
+      const _storedMap = _stored ? _stored.map : null;
+      const _posRaw = (this._isCalibrationEnabled() && this._calibMap && typeof this._calibMap === "object")
+        ? this._calibMap
+        : ((_storedMap && typeof _storedMap === "object")
+            ? _storedMap
+            : ((this._config.port_positions && typeof this._config.port_positions === "object")
+                ? this._config.port_positions
+                : null));
+      const _hasPosOverrides = !!(_posRaw && typeof _posRaw === "object" && Object.keys(_posRaw).length);
+
+      // label_size: if set to 0 and port_scale is autoscale, scale label size with ports.
+      const _labelSizeCfg = Number(this._config.label_size);
+      const _labelBase = (Number.isFinite(_labelSizeCfg) && _labelSizeCfg > 0) ? _labelSizeCfg : Math.max(8, Number(this._config.label_size) || 8);
+      let fs0 = _labelBase;
+
+      // Reserve space for labels to keep autoscale layout stable.
+      // In autoscale grid mode (port_scale=0 with no custom positions), reserve the label area
+      // whether labels are enabled or not, so toggling labels doesn't shift the ports.
+      const reserveLabels = (_autoScaleRequested && !_hasPosOverrides) ? true : !!this._config.show_labels;
+      const labelPad = (reserveLabels && (labelPos !== "inside") && (labelPos !== "above") && (labelPos !== "split")) ? (fs0 + 10) : 12;
+
+
+      // Base (unscaled) grid extents, including gaps.
+      const baseRowW = perRowUsed * P + Math.max(0, (perRowUsed - 1)) * (Number.isFinite(Gh) ? Gh : 0);
+      const baseGridH = rows * P + Math.max(0, (rows - 1)) * (Number.isFinite(Gv) ? Gv : 0);
 
       let storedVB = null;
       if (W <= 0) {
         // Panel width = 0 means "auto".
-        // IMPORTANT:
-        // Do NOT tie the SVG viewBox width to the *current* rendered card width.
-        // Home Assistant's UI editor vs normal dashboard view can produce different
-        // measured widths for a short time while layout settles.
-        // If the viewBox changes after the background image/HA layout stabilizes,
-        // saved port coordinates (stored in viewBox units) will appear to "shift".
-        //
-        // Instead:
-        // 1) Prefer a persisted, stable viewBox from the user's last saved layout.
-        // 2) Otherwise fall back to a content-derived width based on the port grid.
+        // IMPORTANT: Keep viewBox stable across editor/dashboard layout settling.
         storedVB = (() => {
           try {
             const s = this._loadCalibMapFromStorage();
@@ -3977,23 +4108,22 @@ if (elAdv?.style?.display !== "none") refreshExport();
           }
         })();
 
-        if (storedVB && storedVB.w > 0) {
+        // If the user requested autoscale (port_scale = 0) and we are laying out a simple grid
+        // (no explicit per-port positions) and there is no background image, do NOT lock the
+        // viewBox to a previously stored value. A stored viewBox can be much larger than the
+        // grid, causing ports to render tiny with lots of empty space.
+        const ignoreStoredVBForAutoScale = (!!_autoScaleRequested && !_hasPosOverrides && !useBg);
+
+        if (!ignoreStoredVBForAutoScale && storedVB && storedVB.w > 0) {
           W = storedVB.w;
         } else {
-          // A stable default that matches how the port grid is laid out.
-          // This remains constant across editor/dashboard mode.
-          W = Math.max(360, Math.ceil(totalRowW + 2 * sidePad));
+          W = Math.max(360, Math.ceil(baseRowW + 2 * sidePad));
         }
       }
 
-      // Panel height:
-      // - If a background image is configured and we know its aspect ratio, match panel height
-      //   to preserve the image aspect (no stretching and no unnecessary letterboxing).
-      // - Otherwise fall back to content-driven height.
-      let H = Math.max(140, Math.ceil(totalGridH + labelPad + 48));
+      // Panel height: preserve background aspect ratio when available, otherwise content-driven.
+      let H = Math.max(140, Math.ceil(baseGridH + labelPad + 48));
       if (storedVB && Number.isFinite(Number(storedVB.h)) && Number(storedVB.h) > 0) {
-        // Keep a stable viewBox height (paired with W above) so saved coordinates
-        // do not shift as HA layout changes between Edit/normal mode.
         H = Number(storedVB.h);
       }
       if (useBg && !(storedVB && Number.isFinite(Number(storedVB.h)) && Number(storedVB.h) > 0)) {
@@ -4004,14 +4134,112 @@ if (elAdv?.style?.display !== "none") refreshExport();
         }
       }
 
-      // Center ports vertically within the panel.
-      let topPad = Math.max(12, Math.floor((H - totalGridH - labelPad) / 2));
+      // Autoscale behavior (Port scale = 0): do NOT shrink the content within the viewBox.
+      // Instead, rely on the SVG viewBox being sized to the grid and let the browser scale the
+      // whole SVG to the card width. This matches the user's expectation: Port scale=0 means
+      // "fit to available width" and should not result in tiny ports.
+      //
+      // We only apply this when there are no explicit per-port overrides; custom layouts should
+      // remain stable and not be auto-packed.
+      const _autoScaleGrid = false;
+      if (_autoScaleRequested && !_hasPosOverrides) {
+        scale = 1;
+        // Label font size = 0 means "auto"; with viewBox-based scaling we can use the base size
+        // and it will scale with the SVG.
+        if (Number.isFinite(_labelSizeCfg) && _labelSizeCfg === 0) {
+          fs0 = _labelBase;
+        }
+      }
+
+      // Effective spacing. (No per-element scaling; the SVG scales as a whole.)
+      const Pstep = P;
+      const GhStep = (Number.isFinite(Gh) ? Gh : 0);
+      const GvStep = (Number.isFinite(Gv) ? Gv : 0);
+
+      const totalGridH = rows * Pstep + Math.max(0, rows - 1) * GvStep;
+      const totalRowW = perRowUsed * Pstep + Math.max(0, (perRowUsed - 1)) * GhStep;
+
       let maxBottom = H;
       let maxRight = W;
       let plate = "";
-const usableW = W - 2 * sidePad;
-const startX = sidePad + Math.max(0, (usableW - totalRowW) / 2);
-		// Optional per-port positioning overrides (panel view)
+      // Center ports within the panel.
+// We treat side padding as a "safe area" so the grid doesn't touch edges, and we center inside that box.
+// In autoscale grid mode (port_scale=0 with no custom positions), add a little extra padding so ports
+// don't touch the right/bottom edges and the grid looks visually centered.
+const autoPad = (_autoScaleRequested && !_hasPosOverrides) ? 12 : 0;
+
+// Expand the viewBox slightly in autoscale mode for breathing room.
+if (autoPad) {
+  W = W + 2 * autoPad;
+  H = H + 2 * autoPad;
+  maxRight = W;
+  maxBottom = H;
+}
+
+const padX = sidePad + autoPad;
+const padY = 18 + autoPad;
+
+const usableW = Math.max(0, W - 2 * padX);
+const usableH = Math.max(0, H - 2 * padY - labelPad);
+
+const startX = padX + Math.max(0, (usableW - totalRowW) / 2);
+const topPad = padY + Math.max(0, (usableH - totalGridH) / 2);
+		// If the Layout Editor's "Reset positions" was used (auto grid), re-pack automatically when
+      // gap/per-row/order values change, without requiring repeated resets.
+      if (this._isCalibrationEnabled() && this._calibAutoGridEnabled) {
+        const curMeta = {
+          horizontal_port_gap: Number(this._config?.horizontal_port_gap),
+          vertical_port_gap: Number(this._config?.vertical_port_gap),
+          ports_per_row: parseInt(this._config?.ports_per_row, 10) || 0,
+          ports_order: String(this._calibPortsOrder || "numeric"),
+        };
+        const prevMeta = this._calibAutoGridMeta || null;
+        const metaChanged = !prevMeta || Object.keys(curMeta).some(k => String(curMeta[k]) !== String(prevMeta[k]));
+        if (metaChanged) {
+          try {
+            // Build an ordered list of ports (respecting Ports box order setting when present).
+            const ordered = panelPorts.map(([id, st], i) => {
+              const a = st?.attributes || {};
+              const name = String(a.Name || id.split(".")[1] || "");
+              return { id, st, name, i };
+            }).filter(p => p.id && p.name && !_ssmIsHiddenPort(this._config, p.name, p.id));
+
+            const portsOrder = String(this._calibPortsOrder || "numeric");
+            if (portsOrder === "odd_even") {
+              const odds = ordered.filter((_, idx) => (idx % 2) === 0);
+              const evens = ordered.filter((_, idx) => (idx % 2) === 1);
+              ordered.length = 0;
+              ordered.push(...odds, ...evens);
+            }
+
+            const GhA = Number(this._config?.horizontal_port_gap);
+            const GvA = Number(this._config?.vertical_port_gap);
+            const perRowA = Math.max(1, Math.min(Math.max(1, parseInt(this._config?.ports_per_row, 10) || 24), ordered.length || 1));
+            const rowsA = Math.max(1, Math.ceil((ordered.length || 1) / perRowA));
+            const baseRowWA = perRowA * P + Math.max(0, (perRowA - 1)) * (Number.isFinite(GhA) ? GhA : 0);
+            const usableWA = W - 2 * sidePad;
+            const startXA = sidePad + Math.max(0, (usableWA - baseRowWA) / 2);
+            const topPadA = Math.max(12, Math.floor((H - (rowsA * P + Math.max(0, rowsA - 1) * (Number.isFinite(GvA) ? GvA : 0)) - labelPad) / 2));
+
+            const nextMap = {};
+            ordered.forEach((p, idx) => {
+              const col = idx % perRowA;
+              const row = Math.floor(idx / perRowA);
+              const x = startXA + col * (P + (Number.isFinite(GhA) ? GhA : 0));
+              const y = topPadA + row * (P + (Number.isFinite(GvA) ? GvA : 0)) + 18;
+              nextMap[String(p.name)] = { x: applySnap(x), y: applySnap(y) };
+            });
+
+            this._calibMap = nextMap;
+            this._calibAutoGridMeta = curMeta;
+            this._persistCalibDraftToStorage();
+          } catch (e) {
+            // If anything goes sideways, fall back to leaving the existing map as-is.
+          }
+        }
+      }
+
+// Optional per-port positioning overrides (panel view)
       // Map keys are interface Names (e.g. "Gi1/0/1"). Matching is case-insensitive.
       // When calibration mode is enabled we may have a live (in-memory) map that differs from
       // config.port_positions. Use the live map so drag/drop doesn't snap back on refresh.
@@ -4048,9 +4276,9 @@ const startX = sidePad + Math.max(0, (usableW - totalRowW) / 2);
           const _name = String(_a.Name || String(_id || "").split(".")[1] || "");
           if (_ssmIsHiddenPort(this._config, _name, _id)) continue;
 
-          const _idx = _i % perRow, _row = Math.floor(_i / perRow);
-          let _x = startX + _idx * (P + Gh);
-          let _y = topPad + _row * (P + Gv) ;
+          const _idx = _i % perRowUsed, _row = Math.floor(_i / perRowUsed);
+          let _x = startX + _idx * (Pstep + GhStep);
+          let _y = topPad + _row * (Pstep + GvStep) ;
 
           if (portPos) {
             const _key = String(_name).trim().toLowerCase();
@@ -4080,9 +4308,9 @@ const startX = sidePad + Math.max(0, (usableW - totalRowW) / 2);
         const name = String(a.Name || id.split(".")[1] || "");
         if (_ssmIsHiddenPort(this._config, name, id)) return "";
         const alias = a.Alias;
-        const idx = i % perRow, row = Math.floor(i / perRow);
-        let x = startX + idx * (P + Gh);
-        let y = topPad + row * (P + Gv) ;
+        const idx = i % perRowUsed, row = Math.floor(i / perRowUsed);
+        let x = startX + idx * (Pstep + GhStep);
+        let y = topPad + row * (Pstep + GvStep) ;
 
         // Apply explicit position override if provided (values are SVG coords for the port's top-left).
         if (portPos) {
@@ -4100,7 +4328,7 @@ const startX = sidePad + Math.max(0, (usableW - totalRowW) / 2);
         x += offX;
         y += offY;
         const fill = this._colorFor(st);
-        const Ps = P * scale;
+        const Ps = _autoScaleGrid ? Pstep : (P * scale);
         // Ensure the SVG viewBox grows to include any custom-positioned ports.
 // (Label extents are accounted for after label geometry is computed.)
 if (Number.isFinite(y) && Number.isFinite(Ps)) {
@@ -4224,7 +4452,7 @@ const _wrapStyleAttr = _wrapStyles.length ? ` style="${_wrapStyles.join(';')}"` 
 
       const svg = `
         <div class="panel-wrap${useBg ? " bg" : ""}"${_wrapStyleAttr}>
-          <svg data-ssm-panel="1" viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" style="display:block;width:100%;height:auto;">
+          <svg data-ssm-panel="1" viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" style="display:block;width:100%;height:auto;--ssm-label-size:${fs0}px;">
 
             ${this._isCalibrationEnabled() ? `
               <!-- Background hit-target must be BEHIND ports so port dragging/selection works -->
@@ -4984,24 +5212,17 @@ _detectedSpeedLabels(devicePrefix) {
         this._config = { ...config };
 
         // Hydrate Layout positions from localStorage so they persist when the user clicks Save in the HA editor.
-        // This is critical because Layout Editor changes can happen outside the HA config dialog.
-        try {
-          const prefix = (this._config?.device || "") ? String(this._config.device) : "";
-          const bg = String(this._config?.background_image || "");
-          const key = `ssm_calib_v2:${prefix || "unknown"}:${bg}`;
-          const raw = localStorage.getItem(key);
-          if (raw) {
-            const obj = JSON.parse(raw);
-            const map = (obj && typeof obj === "object" && obj.map && typeof obj.map === "object")
-              ? obj.map
-              : (obj && typeof obj === "object" ? obj : null);
-            if (map && typeof map === "object") {
-              this._config.port_positions = map;
-            }
-          }
-        } catch (e) {}
-
-        // If the user closed the Layout Editor from the live card, reset the toggle here so it persists.
+// This is critical because Layout Editor changes can happen outside the HA config dialog.
+// NOTE: Use the same storage key logic as the runtime layout loader (v3 + draft, with legacy v2 fallback),
+// otherwise editor re-renders can overwrite the preview with stale saved positions.
+try {
+  const stored = this._loadCalibMapFromStorage();
+  const map = (stored && stored.map && typeof stored.map === "object") ? stored.map : null;
+  if (map) {
+    this._config.port_positions = map;
+  }
+} catch (e) {}
+// If the user closed the Layout Editor from the live card, reset the toggle here so it persists.
 // IMPORTANT: do NOT clear the flag until the config actually has calibration_mode=false saved,
 // otherwise "Cancel" in the HA editor would resurrect the old YAML value.
 try {
@@ -5547,7 +5768,7 @@ details.section > summary::after{
 
                 <div class="row">${c.view === "panel" ? `
                   <div class="rowhead"><label for="port_scale">Port scale</label><div class="helpiconbtn" data-help-title="Port scale" data-help="port_scale"><ha-icon icon="mdi:help-circle-outline"></ha-icon></div></div>
-                  <input id="port_scale" type="number" step="0.05" min="0.1" value="${c.port_scale != null ? Number(c.port_scale) : 1}"${c.view === "list" ? " disabled" : ""}>
+                  <input id="port_scale" type="number" step="0.05" min="0" value="${c.port_scale != null ? Number(c.port_scale) : 1}"${c.view === "list" ? " disabled" : ""}>
                 ` : ""}</div>
 
                 <div class="row two">${c.view === "panel" ? `
@@ -5636,7 +5857,7 @@ details.section > summary::after{
 ` : ""}${c.view === "panel" ? `
 <div class="row">
                   <label for="label_size">Label font size</label>
-                  <input id="label_size" type="number" min="1" value="${c.label_size != null ? Number(c.label_size) : 8}"${c.view === "list" ? " disabled" : ""}>
+                  <input id="label_size" type="number" min="0" value="${c.label_size != null ? Number(c.label_size) : 8}"${c.view === "list" ? " disabled" : ""}>
                 </div>
 
                 
@@ -6052,7 +6273,7 @@ const updateSpeedColor = (label, color) => {
         });
         root.getElementById("port_scale")?.addEventListener("change", (ev) => {
           const v = parseFloat(ev.target.value);
-          this._updateConfig("port_scale", (Number.isFinite(v) && v > 0) ? v : 1);
+          this._updateConfig("port_scale", (Number.isFinite(v) && v >= 0) ? v : 1);
         });
 
 // Horizontal/Vertical port gap (canonical keys)
@@ -6086,6 +6307,7 @@ root.getElementById("vertical_port_gap")?.addEventListener("change", (ev) => {
 
         root.getElementById("calibration_mode")?.addEventListener("change", (ev) => {
           this._updateConfig("calibration_mode", !!ev.target.checked);
+          if (!ev.target.checked) { this._clearCalibDraftFromStorage(); }
         
           try {
             const prefix = (this._config?.device || "") ? String(this._config.device) : "all";
