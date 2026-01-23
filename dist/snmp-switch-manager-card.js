@@ -500,11 +500,53 @@ _setLayoutEditorSessionClosed() {
 
   _stripDiagPrefix(name) {
     if (typeof name !== "string") return name;
+    let s = String(name || "").trim();
+    if (!s) return name;
+
     const prefix = this._inferDevicePrefix();
     if (!prefix) return name;
-    const cand = prefix.replace(/_/g, "-").toUpperCase();
-    const re = new RegExp("^" + cand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s+", "i");
-    return name.replace(re, "");
+
+    const p = String(prefix || "").trim();
+    const candidates = [];
+
+    // Candidates derived from the inferred entity prefix
+    if (p) {
+      candidates.push(p);
+      candidates.push(p.replace(/_/g, "-"));
+      candidates.push(p.replace(/_/g, " "));
+      candidates.push(p.replace(/_/g, "."));
+      candidates.push(p.replace(/-/g, "_"));
+      candidates.push(p.replace(/-/g, "."));
+      candidates.push(p.replace(/-/g, " "));
+    }
+
+    // Also try the user-visible device name (when available)
+    try {
+      const dn = (typeof this._deviceDisplayNameByPrefix === "function") ? this._deviceDisplayNameByPrefix(p) : "";
+      const d = String(dn || "").trim();
+      if (d) {
+        candidates.push(d);
+        const dNorm = d.toLowerCase();
+        const dSlug = dNorm.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+        const dUnd  = dNorm.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+        if (dSlug) candidates.push(dSlug);
+        if (dUnd) candidates.push(dUnd);
+      }
+    } catch (_) {}
+
+    // Collapse any immediate duplicated leading token first (e.g., "hades.otispresley.com hades.otispresley.com …")
+    s = s.replace(/^(\S+)\s+\1\s+/i, "$1 ").trim();
+
+    // Strip any leading candidate like "<prefix> " or "<prefix> - " or "<prefix>: "
+    for (const cand of candidates) {
+      const c = String(cand || "").trim();
+      if (!c) continue;
+      const esc = c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp("^" + esc + "\\s*[-–:.,]?\\s*", "i");
+      s = s.replace(re, "").trim();
+    }
+
+    return s;
   }
 
 
